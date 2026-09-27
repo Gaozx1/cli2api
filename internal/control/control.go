@@ -2,11 +2,12 @@ package control
 
 // Services is the console application surface assembled by app.New.
 type Services struct {
-	Accounts *Accounts
-	Keys     *Keys
-	Settings *Settings
-	Backup   *Backup
-	Catalog  *Catalog
+	Accounts  *Accounts
+	Keys      *Keys
+	Settings  *Settings
+	Backup    *Backup
+	Catalog   *Catalog
+	Donations *Donations
 }
 
 func New(runtime Runtime) *Services {
@@ -14,10 +15,13 @@ func New(runtime Runtime) *Services {
 		return nil
 	}
 	store := runtime.Store()
+	settings := NewSettings(store)
+	accountService := NewAccounts(runtime)
 	return &Services{
-		Accounts: NewAccounts(runtime),
-		Keys:     NewKeys(store),
-		Settings: NewSettings(store),
-		Backup:   NewBackup(store),
+		Accounts:  accountService,
+		Keys:      NewKeys(store),
+		Settings:  settings,
+		Backup:    NewBackup(store),
+		Donations: NewDonations(settings, accountService),
 	}
 }

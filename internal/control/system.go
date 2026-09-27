@@ -26,6 +26,8 @@ type SystemSettingsPatch struct {
 	ProxyURL               *string           `json:"proxy_url"`
 	WorkBuddyCheckinTime   *string           `json:"workbuddy_checkin_time"`
 	CheckinTimes           map[string]string `json:"checkin_times"`
+	DonationBaseURL        *string           `json:"donation_base_url"`
+	DonationToken          *string           `json:"donation_token"`
 }
 type SystemSettings struct {
 	CrossProviderModelPool bool                          `json:"cross_provider_model_pool"`
@@ -35,21 +37,29 @@ type SystemSettings struct {
 	CheckinTimes           map[string]string             `json:"checkin_times"`
 	Timezone               string                        `json:"timezone"`
 	SessionAffinity        executor.SessionAffinityStats `json:"session_affinity"`
+	DonationBaseURL        string                        `json:"donation_base_url"`
+	DonationConfigured     bool                          `json:"donation_configured"`
 }
 
 func (h *System) Current(ctx context.Context) SystemSettings {
 	var proxyURL string
+	var donationBase, donationToken string
 	checkin := ""
 	if h.Settings != nil {
 		proxyURL, _, _ = h.Settings.GetSecret(ctx, proxyURLSecret)
 		checkin = h.Settings.WorkBuddyCheckinTimeDefault(ctx)
+		donationBase, _, _ = h.Settings.GetSecret(ctx, donationBaseURLSecret)
+		donationToken, _, _ = h.Settings.GetSecret(ctx, donationTokenSecret)
 	}
 	settings := SystemSettings{
 		CrossProviderModelPool: h.CrossProviderPool.Load(),
 		ProxyURL:               proxy.Redact(proxyURL),
 		WorkBuddyCheckinTime:   checkin,
 		CheckinTimes:           map[string]string{},
-		Timezone:               time.Now().Format("MST -07:00"),
+		// The donation token is a credential: report only whether one is set.
+		DonationBaseURL:    donationBase,
+		DonationConfigured: strings.TrimSpace(donationBase) != "" && strings.TrimSpace(donationToken) != "",
+		Timezone:           time.Now().Format("MST -07:00"),
 	}
 	for _, descriptor := range providers.List() {
 		if descriptor.SupportsCheckin() && h.Settings != nil {
@@ -66,7 +76,7 @@ func (h *System) Current(ctx context.Context) SystemSettings {
 }
 
 func (h *System) Patch(ctx context.Context, input SystemSettingsPatch) error {
-	if input.CrossProviderModelPool == nil && input.RoutingStrategy == nil && input.ProxyURL == nil && input.WorkBuddyCheckinTime == nil && len(input.CheckinTimes) == 0 {
+	if input.CrossProviderModelPool == nil && input.RoutingStrategy == nil && input.ProxyURL == nil && input.WorkBuddyCheckinTime == nil && len(input.CheckinTimes) == 0 && input.DonationBaseURL == nil && input.DonationToken == nil {
 		return operationError("invalid_request", "a system setting is required")
 	}
 	var strategy string
@@ -158,6 +168,20 @@ func (h *System) Patch(ctx context.Context, input SystemSettingsPatch) error {
 	}
 	for providerID, value := range checkinTimes {
 		if err := h.Settings.SetSecret(ctx, accounts.CheckinTimeSecret(providerID), value); err != nil {
+			return operationError("system_settings_save_failed", err.Error())
+		}
+	}
+	if input.DonationBaseURL != nil {
+		base := strings.TrimRight(strings.TrimSpace(*input.DonationBaseURL), "/")
+		if base != "" && !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+			return operationError("invalid_request", "donation_base_url must be an http(s) URL")
+		}
+		if err := h.Settings.SetSecret(ctx, donationBaseURLSecret, base); err != nil {
+			return operationError("system_settings_save_failed", err.Error())
+		}
+	}
+	if input.DonationToken != nil {
+		if err := h.Settings.SetSecret(ctx, donationTokenSecret, strings.TrimSpace(*input.DonationToken)); err != nil {
 			return operationError("system_settings_save_failed", err.Error())
 		}
 	}

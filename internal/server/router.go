@@ -30,6 +30,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/logs", s.withConsoleKey(s.consoleHandler().HandleLogs))
 	s.mux.HandleFunc("/api/logs/", s.withConsoleKey(s.consoleHandler().HandleLogs))
 	s.mux.HandleFunc("/api/chat", s.withConsoleKey(s.consoleHandler().HandleChat))
+	// Donations stay public: a contributor has no console key, and the reward is
+	// credited to their own New API user id. See console.HandleDonations.
+	s.mux.HandleFunc("/api/donations", s.consoleHandler().HandleDonations)
 	s.mux.HandleFunc(endpoint.ModelsPath, s.withAPIKey(s.gatewayHandler().HandleModels))
 	s.mux.HandleFunc(endpoint.ChatCompletionsPath, s.withAPIKey(s.gatewayHandler().HandleChatCompletions))
 	s.mux.HandleFunc(endpoint.MessagesPath, s.withAPIKey(s.gatewayHandler().HandleAnthropicMessages))
@@ -51,7 +54,7 @@ func (s *Server) routes() {
 			r.URL.Path != "/og-card.svg" &&
 			r.URL.Path != "/site.webmanifest" {
 			switch r.URL.Path {
-			case "/login", "/auth", "/providers", "/access", "/accounts", "/system", "/logs", "/keys":
+			case "/login", "/auth", "/providers", "/access", "/accounts", "/system", "/logs", "/keys", "/donations":
 			default:
 				http.NotFound(w, r)
 				return
