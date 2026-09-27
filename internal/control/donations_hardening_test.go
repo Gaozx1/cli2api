@@ -54,6 +54,7 @@ func donationImportHarness(t *testing.T, format string, importer *fakeDonationIm
 		ID:         "workbuddy",
 		Credential: importer,
 		Prober:     &fakeProber{ready: true},
+		Models:     &fakeModels{},
 	})
 	accountsSvc.Providers = registry
 	return &Donations{

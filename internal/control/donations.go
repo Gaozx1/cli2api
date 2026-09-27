@@ -664,27 +664,58 @@ func (d *Donations) recordClaim(ctx context.Context, fingerprint string, claim D
 // Credential validation is a local shape check (a non-empty token, a user_
 // prefix), so a fabricated credential passes it. Probe alone is not enough
 // either: for WorkBuddy, Trae and Codex it only re-reads the stored credential.
-// Quota is a real provider call for every adapter, so it is the liveness proof
-// used here. A provider that cannot be reached is treated as not live, because
-// paying for an account nobody can verify is the failure mode this guards.
+// So this makes a real provider call.
+//
+// The call is Models rather than Quota, because quota/billing endpoints are
+// flaky in a way that says nothing about the credential: a genuinely live
+// account whose billing endpoint returns a transient 500 must not be refused.
+// Models authenticates the credential, which is exactly the question here.
+//
+// A transport or server-side failure is reported as retryable so the caller can
+// treat it as "not verified yet" rather than "this credential is bad".
 func (d *Donations) verifyAccountLive(ctx context.Context, providerID, accountID string) error {
 	adapter, ok := d.donationAdapter(providerID)
 	if !ok {
 		return operationError("provider_unsupported", "this provider is not available")
 	}
 	if adapter.Prober != nil {
-		// A probe that positively reports not-ready is authoritative.
-		if health, err := adapter.Prober.Probe(ctx, accountID); err == nil && !health.Ready && health.LastError != "" {
+		// A probe that positively reports not-ready with an auth-class reason is
+		// authoritative: the credential itself was rejected.
+		health, err := adapter.Prober.Probe(ctx, accountID)
+		if err == nil && !health.Ready && health.LastError != "" && donationAuthClassError(health.LastError) {
 			return operationError("account_not_live", "the account did not pass its provider check: "+health.LastError)
 		}
 	}
-	if adapter.Prober == nil {
+	if adapter.Models == nil {
 		return operationError("account_unverifiable", "this provider cannot verify a contributed account")
 	}
-	if _, err := adapter.Prober.Quota(ctx, accountID); err != nil {
-		return operationError("account_not_live", "the account could not be verified with its provider: "+err.Error())
+	if _, err := adapter.Models.Models(ctx, accountID); err != nil {
+		if donationAuthClassError(err.Error()) {
+			return operationError("account_not_live", "the provider rejected this credential: "+err.Error())
+		}
+		return operationError("account_unverified", "the account could not be verified right now: "+err.Error())
 	}
 	return nil
+}
+
+// donationAuthClassError reports whether an error means the credential itself was
+// rejected, as opposed to the provider being unreachable or erroring.
+//
+// Only the former should disqualify a contribution: refusing a valid account
+// because a provider had a bad minute is worse than the abuse this guards.
+func donationAuthClassError(message string) bool {
+	lower := strings.ToLower(message)
+	for _, marker := range []string{
+		"unauthorized", "unauthenticated", "invalid token", "invalid access token",
+		"invalid api key", "invalid key", "token expired", "expired token",
+		"login_required", "login required", "authentication failed", "auth failed",
+		"401", "403", "permission denied", "forbidden",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // donationProvider maps a contribution format to its provider family.

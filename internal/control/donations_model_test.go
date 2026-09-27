@@ -40,6 +40,29 @@ func (f *fakeProber) Quota(context.Context, string) (*providers.QuotaInfo, error
 	return &providers.QuotaInfo{}, nil
 }
 
+// fakeModels is a provider catalog whose failure is controllable.
+type fakeModels struct {
+	mu  sync.Mutex
+	err error
+	hit int
+}
+
+func (f *fakeModels) Models(context.Context, string) ([]providers.ModelInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hit++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return []providers.ModelInfo{{NativeModel: "m1", PublicModel: "m1"}}, nil
+}
+
+func (f *fakeModels) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hit
+}
+
 func (f *fakeProber) counts() (int, int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -61,6 +84,7 @@ func donationModelHarness(t *testing.T, prober *fakeProber) (*Donations, *fakeSt
 		ID:         "command",
 		Credential: importer,
 		Prober:     prober,
+		Models:     &fakeModels{},
 	})
 	accountsSvc.Providers = registry
 
@@ -100,7 +124,7 @@ func TestCredentialFingerprintIsStable(t *testing.T) {
 // A credential that is not live must not be rewarded, and must not be left in
 // the pool either.
 func TestSubmitRefusesNotLiveAccount(t *testing.T) {
-	prober := &fakeProber{ready: true, quotaErr: errNotLive}
+	prober := &fakeProber{ready: false, lastErr: `UNAUTHORIZED 401 Invalid 'Authorization' header`}
 	donations, store := donationModelHarness(t, prober)
 	var hits int32
 	site := creditSite(t, &hits)
@@ -116,7 +140,7 @@ func TestSubmitRefusesNotLiveAccount(t *testing.T) {
 	if err == nil {
 		t.Fatal("an account that fails its provider check must be refused")
 	}
-	if !strings.Contains(err.Error(), "could not be verified") {
+	if !strings.Contains(err.Error(), "did not pass its provider check") {
 		t.Fatalf("err = %v, want a verification failure", err)
 	}
 	if hits != 0 {
@@ -156,6 +180,13 @@ func TestSubmitRefusesProbeNotReady(t *testing.T) {
 func TestSubmitCreditsLiveAccount(t *testing.T) {
 	prober := &fakeProber{ready: true}
 	donations, store := donationModelHarness(t, prober)
+	models := &fakeModels{}
+	donations.accounts.Providers.Register(providers.Adapter{
+		ID:         "command",
+		Credential: &fakeDonationImporter{format: "command-key-v1"},
+		Prober:     prober,
+		Models:     models,
+	})
 	var hits int32
 	site := creditSite(t, &hits)
 	donations.HTTP = site.Client()
@@ -173,8 +204,8 @@ func TestSubmitCreditsLiveAccount(t *testing.T) {
 	if !result.Credited || hits != 1 {
 		t.Fatalf("a live account must be credited once: %+v hits=%d", result, hits)
 	}
-	if _, quotas := prober.counts(); quotas == 0 {
-		t.Fatal("liveness must involve a real provider call (Quota)")
+	if models.calls() == 0 {
+		t.Fatal("liveness must involve a real provider call (Models)")
 	}
 	if len(store.accounts) != 1 {
 		t.Fatalf("the live account must stay in the pool, have %d", len(store.accounts))
@@ -339,6 +370,107 @@ func TestSubmitRefusesUnverifiableProvider(t *testing.T) {
 }
 
 var errNotLive = &providerCheckError{"the account is not usable"}
+
+// A provider that has a bad minute must not disqualify a valid account. This is
+// the case found live: a genuinely working WorkBuddy account was refused because
+// its billing endpoint returned a transient 500.
+func TestSubmitDoesNotRefuseOnTransientProviderError(t *testing.T) {
+	prober := &fakeProber{ready: true}
+	donations, _ := donationModelHarness(t, prober)
+	// Swap in a catalog that fails the way a transient upstream fault does.
+	donations.accounts.Providers.Register(providers.Adapter{
+		ID:         "command",
+		Credential: &fakeDonationImporter{format: "command-key-v1"},
+		Prober:     prober,
+		Models:     &fakeModels{err: &providerCheckError{"user-resource status=500: 500 Internal Server Error"}},
+	})
+	var hits int32
+	site := creditSite(t, &hits)
+	donations.HTTP = site.Client()
+	donations.BaseURL = site.URL
+	donations.Token = "t"
+
+	_, err := donations.Submit(context.Background(), DonationRequest{
+		Format:       "command-key-v1",
+		NewAPIUserID: 7,
+		Credential:   []byte(`{"api_key":"user_real"}`),
+	})
+	if err == nil {
+		t.Fatal("an unverifiable-this-minute account must not be silently credited")
+	}
+	// It must be reported as unverified, not as a bad credential: an operator
+	// can retry, and the contributor is not told their account is invalid.
+	if !strings.Contains(err.Error(), "could not be verified right now") {
+		t.Fatalf("err = %v, want a retryable verification failure", err)
+	}
+	if strings.Contains(err.Error(), "rejected this credential") {
+		t.Fatal("a transient provider fault must not be reported as a rejected credential")
+	}
+	if hits != 0 {
+		t.Fatalf("nothing may be credited without verification, hits=%d", hits)
+	}
+}
+
+// A provider that rejects the credential itself is refused as such, so the
+// contributor gets an actionable message.
+func TestSubmitReportsRejectedCredential(t *testing.T) {
+	prober := &fakeProber{ready: true}
+	donations, _ := donationModelHarness(t, prober)
+	donations.accounts.Providers.Register(providers.Adapter{
+		ID:         "command",
+		Credential: &fakeDonationImporter{format: "command-key-v1"},
+		Prober:     prober,
+		Models:     &fakeModels{err: &providerCheckError{"UNAUTHORIZED 401 Invalid 'Authorization' header"}},
+	})
+	var hits int32
+	site := creditSite(t, &hits)
+	donations.HTTP = site.Client()
+	donations.BaseURL = site.URL
+	donations.Token = "t"
+
+	_, err := donations.Submit(context.Background(), DonationRequest{
+		Format:       "command-key-v1",
+		NewAPIUserID: 7,
+		Credential:   []byte(`{"api_key":"user_fake"}`),
+	})
+	if err == nil {
+		t.Fatal("a rejected credential must be refused")
+	}
+	if !strings.Contains(err.Error(), "rejected this credential") {
+		t.Fatalf("err = %v, want a rejected-credential message", err)
+	}
+	if hits != 0 {
+		t.Fatalf("nothing may be credited, hits=%d", hits)
+	}
+}
+
+// The classifier must not mistake a transient fault for a bad credential.
+func TestDonationAuthClassError(t *testing.T) {
+	authClass := []string{
+		"UNAUTHORIZED 401 Invalid 'Authorization' header",
+		"invalid access token",
+		"token expired",
+		"login_required",
+		"403 Forbidden",
+	}
+	for _, msg := range authClass {
+		if !donationAuthClassError(msg) {
+			t.Errorf("%q must be classified as an auth failure", msg)
+		}
+	}
+	transient := []string{
+		"user-resource status=500: 500 Internal Server Error",
+		"context deadline exceeded",
+		"dial tcp: connection refused",
+		"503 Service Unavailable",
+		"502 Bad Gateway",
+	}
+	for _, msg := range transient {
+		if donationAuthClassError(msg) {
+			t.Errorf("%q must NOT be classified as an auth failure", msg)
+		}
+	}
+}
 
 type providerCheckError struct{ msg string }
 
