@@ -253,10 +253,10 @@ func TestChatNonStreamAggregatesToolsAndReasoning(t *testing.T) {
 	}
 }
 
-// Solo answers 200 and only then fails inside the stream, so the quota error
+// Solo answers 200 and only then fails inside the stream, so the request-limit error
 // cannot surface as a ChatStream return value: bytes are already committed.
 // The rewritten body must report it as a read error once drained.
-func TestChatStreamQuotaErrorAfterContentIsReadable(t *testing.T) {
+func TestChatStreamRequestLimitAfterContentIsReadable(t *testing.T) {
 	stream := "event: metadata\ndata: {\"model\":\"deepseek-v4-flash\"}\n\n" +
 		"event: output\ndata: {\"response\":\"partial\"}\n\n" +
 		"event: error\ndata: {\"code\":4008,\"message\":\"Your requests have exceeded the quota.\"}\n\n"
@@ -291,7 +291,7 @@ func TestChatStreamQuotaErrorAfterContentIsReadable(t *testing.T) {
 	if !errors.As(readErr, &classified) {
 		t.Fatalf("readErr=%v", readErr)
 	}
-	if classified.Kind != accounts.KindQuota {
+	if classified.Kind != accounts.KindRateLimit {
 		t.Fatalf("kind=%s", classified.Kind)
 	}
 	if classified.RetryAfter != 0 {
@@ -299,7 +299,7 @@ func TestChatStreamQuotaErrorAfterContentIsReadable(t *testing.T) {
 	}
 }
 
-func TestChatStreamQuotaErrorBeforeContentStillFailsUpFront(t *testing.T) {
+func TestChatStreamRequestLimitBeforeContentStillFailsUpFront(t *testing.T) {
 	stream := "event: metadata\ndata: {\"model\":\"deepseek-v4-flash\"}\n\n" +
 		"event: error\ndata: {\"code\":4008,\"message\":\"Your requests have exceeded the quota.\"}\n\n"
 	payload, _ := Credential{AccessToken: "at", RefreshToken: "rt", UID: "u1", ExpiresAt: 4102444800}.Encode()
@@ -324,7 +324,7 @@ func TestChatStreamQuotaErrorBeforeContentStillFailsUpFront(t *testing.T) {
 		resp.Body.Close()
 	}
 	var classified *providers.Error
-	if !errors.As(err, &classified) || classified.Kind != accounts.KindQuota {
+	if !errors.As(err, &classified) || classified.Kind != accounts.KindRateLimit {
 		t.Fatalf("err=%v classified=%+v", err, classified)
 	}
 }
@@ -596,7 +596,7 @@ func TestErrorMappingAndCooldown(t *testing.T) {
 	}{
 		{401, `{"code":1001}`, "auth", "1001"},
 		{200, `{"code":1005,"message":"plan"}`, "quota", "1005"},
-		{200, `{"code":4008}`, "quota", "4008"},
+		{200, `{"code":4008}`, "rate_limit", "4008"},
 		{200, `{"code":4001}`, "invalid_request", "4001"},
 		{429, `{"code":"insufficient_quota","message":"token-limit"}`, "invalid_request", "insufficient_quota"},
 		{200, `{"code":4011}`, "rate_limit", "4011"},

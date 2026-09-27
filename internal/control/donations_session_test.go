@@ -55,7 +55,7 @@ func donationHarness(t *testing.T, login *fakeLogin, site *httptest.Server) (*Do
 	runtime := &fakeRuntime{log: log, store: store}
 	accountsSvc := NewAccounts(runtime)
 	registry := providers.NewRegistry()
-	registry.Register(providers.Adapter{ID: "workbuddy", Login: login})
+	registry.Register(providers.Adapter{ID: "workbuddy", Login: login, Prober: &fakeProber{ready: true}})
 	accountsSvc.Providers = registry
 
 	donations := &Donations{
@@ -348,7 +348,7 @@ func TestCallbackRequiredFormatIsFlaggedAndNotPolled(t *testing.T) {
 	login := &fakeLogin{authURL: "https://provider.example/auth"}
 	donations, _, _ := donationHarness(t, login, site)
 	// Register a completer so the adapter advertises the callback capability.
-	donations.accounts.Providers.Register(providers.Adapter{ID: "trae", Login: &fakeCompletingLogin{fakeLogin: login}})
+	donations.accounts.Providers.Register(providers.Adapter{ID: "trae", Login: &fakeCompletingLogin{fakeLogin: login}, Prober: &fakeProber{ready: true}})
 
 	formats := donations.Formats()
 	var trae *DonationFormatInfo
@@ -396,7 +396,7 @@ func TestCompleteSessionCredits(t *testing.T) {
 	site := creditSite(t, &hits)
 	login := &fakeLogin{authURL: "https://provider.example/auth"}
 	donations, store, _ := donationHarness(t, login, site)
-	donations.accounts.Providers.Register(providers.Adapter{ID: "trae", Login: &fakeCompletingLogin{fakeLogin: login}})
+	donations.accounts.Providers.Register(providers.Adapter{ID: "trae", Login: &fakeCompletingLogin{fakeLogin: login}, Prober: &fakeProber{ready: true}})
 
 	session, err := donations.StartSession(context.Background(), DonationStart{
 		Format: "trae-oauth-v1", NewAPIUserID: 7,
@@ -440,7 +440,7 @@ func TestFormatsReportAdapterCapabilities(t *testing.T) {
 	donations, _, _ := donationHarness(t, &fakeLogin{}, nil)
 	// Harness registers workbuddy with a plain login; add trae as a completer
 	// so the two capability shapes can be compared.
-	donations.accounts.Providers.Register(providers.Adapter{ID: "trae", Login: &fakeCompletingLogin{fakeLogin: &fakeLogin{}}})
+	donations.accounts.Providers.Register(providers.Adapter{ID: "trae", Login: &fakeCompletingLogin{fakeLogin: &fakeLogin{}}, Prober: &fakeProber{ready: true}})
 
 	formats := donations.Formats()
 	if len(formats) == 0 {

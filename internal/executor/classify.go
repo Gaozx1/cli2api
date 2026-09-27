@@ -171,6 +171,11 @@ func Classify(status int, body, retryAfter, kindHint, failoverHint string) Class
 		switch {
 		case quotaLike(lower, code, typ):
 			kind = KindQuota
+		case traeRequestLimit(code):
+			// Trae 4008: a per-window request cap whose message contains the word
+			// "quota". It is a volume limit that clears when the window rolls, so
+			// fail over and cool briefly rather than parking until midnight.
+			kind = KindRateLimit
 		case modelNotAvailableLike(lower, code):
 			kind = KindModelNotAvailable
 		case notReadyLike(lower):
@@ -193,7 +198,10 @@ func Classify(status int, body, retryAfter, kindHint, failoverHint string) Class
 	if kind == KindAuth && quotaLike(lower, code, typ) {
 		kind = KindQuota
 	}
-	if kind == KindRateLimit && quotaLike(lower, code, typ) {
+	// A rate-limit verdict is promoted to quota when the body also reads like an
+	// exhausted entitlement -- except for Trae 4008, whose message says "quota"
+	// while actually being a per-window request cap.
+	if kind == KindRateLimit && quotaLike(lower, code, typ) && !traeRequestLimit(code) {
 		kind = KindQuota
 	}
 
@@ -359,8 +367,19 @@ func stringifyJSONCode(v any) string {
 	}
 }
 
+// traeRequestLimit reports whether a body carries Trae's Solo 4008 code.
+//
+// It is a per-window request cap ("Your requests have exceeded the quota"), not
+// an exhausted entitlement pack: accounts hit it while still holding most of
+// their credits, and it clears when the window rolls. Treated as hard quota it
+// parked the account until local midnight and, with Failover=false, failed the
+// whole request instead of trying the next account.
+func traeRequestLimit(code string) bool {
+	return code == "4008"
+}
+
 func quotaLike(lower, code, typ string) bool {
-	if code == "insufficient_quota" || typ == "insufficient_quota" || code == "1005" || code == "4008" || code == "14018" {
+	if code == "insufficient_quota" || typ == "insufficient_quota" || code == "1005" || code == "14018" {
 		return true
 	}
 	return strings.Contains(lower, "insufficient_quota") ||

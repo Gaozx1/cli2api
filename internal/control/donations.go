@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -41,10 +42,39 @@ type Donations struct {
 	// and rebuilt on restart; a swept session leaves no reward behind.
 	mu       sync.Mutex
 	sessions map[string]*DonationSession
+	// ledger records what has already been paid, so a repeat submission of the
+	// same credential (or from the same New API user) is refused.
+	ledger *DonationRewardLedger
 	// loaded guards the one-time restore of pending sessions from the store.
 	loaded bool
 	// clock is injectable for tests.
 	clock func() time.Time
+}
+
+// DonationRewardLedger records what has already been paid, so one credential or
+// one New API user cannot be rewarded twice.
+//
+// The donation endpoints are unauthenticated, so without this a caller can
+// submit the same credential repeatedly and collect the reward each time. The
+// ledger is persisted: an in-memory-only record would be reset by a restart,
+// which is exactly when a repeat claim is most attractive.
+type DonationRewardLedger struct {
+	// Credentials maps a credential fingerprint to the New API user id it was
+	// already paid for, so the same account cannot be contributed twice.
+	Credentials map[string]DonationClaim `json:"credentials"`
+	// Users counts how many rewards one New API user id has received, so a
+	// single contributor cannot farm the endpoint with many credentials.
+	Users map[string]int `json:"users"`
+}
+
+// DonationClaim is one recorded payout, kept so a repeat submission can be
+// reported back with the account it already belongs to.
+type DonationClaim struct {
+	NewAPIUserID int       `json:"newapi_user_id"`
+	AccountID    string    `json:"account_id"`
+	Provider     string    `json:"provider"`
+	Region       string    `json:"region"`
+	ClaimedAt    time.Time `json:"claimed_at"`
 }
 
 // DonationFormatInfo describes one contributable credential format. The console
@@ -365,8 +395,27 @@ func (d *Donations) Submit(ctx context.Context, input DonationRequest) (Donation
 	// ignored, so a rejected or absurd value cannot influence the payout.
 	usd := donationRewardUSD()
 
+	// Refuse a repeat before importing anything, so a duplicate submission does
+	// not leave a second copy of the same account in the pool.
+	payload, err := donationCredentialPayload(input)
+	if err != nil {
+		return DonationResult{}, err
+	}
+	fingerprint, err := d.checkClaimable(ctx, input.Format, payload, input.NewAPIUserID)
+	if err != nil {
+		return DonationResult{}, err
+	}
+
 	created, err := d.importAccount(ctx, providerID, region, input)
 	if err != nil {
+		return DonationResult{}, err
+	}
+
+	// Prove the account works before paying for it. A credential that only
+	// passes the local shape check is not worth a reward, and importing it
+	// already put it in the pool, so it is removed again when it is not live.
+	if err := d.verifyAccountLive(ctx, providerID, created.ID); err != nil {
+		_ = d.accounts.Delete(ctx, created.ID)
 		return DonationResult{}, err
 	}
 
@@ -387,8 +436,33 @@ func (d *Donations) Submit(ctx context.Context, input DonationRequest) (Donation
 		result.CreditError = err.Error()
 		return result, nil
 	}
+	d.recordClaim(ctx, fingerprint, DonationClaim{
+		NewAPIUserID: input.NewAPIUserID,
+		AccountID:    created.ID,
+		Provider:     providerID,
+		Region:       region,
+		ClaimedAt:    d.now(),
+	})
 	result.Credited = true
 	return result, nil
+}
+
+// donationCredentialPayload is the credential bytes a submission carries, in the
+// form the fingerprint is computed over.
+func donationCredentialPayload(input DonationRequest) ([]byte, error) {
+	if input.Format == donationQoderFormat {
+		// Qoder carries a blob plus machine id rather than a JSON credential.
+		blob := strings.TrimSpace(input.UserBlob)
+		machine := strings.TrimSpace(input.MachineID)
+		if blob == "" || machine == "" {
+			return nil, operationError("invalid_credential", "user_blob and machine_id are required")
+		}
+		return []byte(machine + "\x00" + blob), nil
+	}
+	if len(input.Credential) == 0 {
+		return nil, operationError("invalid_credential", "credential is required")
+	}
+	return input.Credential, nil
 }
 
 // donationStrippedCredentialFields are credential fields that select the host a
@@ -480,6 +554,143 @@ func (d *Donations) importAccount(ctx context.Context, providerID, region string
 		Enabled:    false,
 		Credential: sanitized,
 	}, sanitized)
+}
+
+// donationLedgerSecret persists the reward ledger. It must outlive a restart:
+// the endpoints are unauthenticated, so a reset ledger re-opens every claim
+// that was already paid.
+const donationLedgerSecret = "donation_reward_ledger"
+
+// donationMaxRewardsPerUser bounds how many rewards one New API user id may
+// collect. A contributor normally holds one or two accounts; a much larger
+// number is farming rather than contributing.
+const donationMaxRewardsPerUser = 3
+
+// donationCredentialFingerprint identifies a credential by its content, so the
+// same account cannot be contributed twice under different names.
+//
+// It hashes the canonical JSON of the payload with the host-override fields
+// already stripped, so a resubmission that merely adds or changes base_url is
+// recognised as the same credential rather than treated as a new one.
+func donationCredentialFingerprint(format string, payload []byte) string {
+	canonical := payload
+	if stripped, err := stripDonationCredentialHosts(payload); err == nil {
+		canonical = stripped
+	}
+	// Re-encode so key order and whitespace cannot change the fingerprint.
+	var doc map[string]any
+	if err := json.Unmarshal(canonical, &doc); err == nil && doc != nil {
+		if encoded, err := json.Marshal(doc); err == nil {
+			canonical = encoded
+		}
+	}
+	sum := sha256.Sum256(append([]byte(format+"\x00"), canonical...))
+	return hex.EncodeToString(sum[:])
+}
+
+// ledgerSnapshot returns the current ledger, loading it from the store once.
+func (d *Donations) ledgerSnapshot(ctx context.Context) DonationRewardLedger {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.ledger == nil {
+		d.ledger = &DonationRewardLedger{
+			Credentials: map[string]DonationClaim{},
+			Users:       map[string]int{},
+		}
+		if d.settings != nil {
+			if raw, ok, err := d.settings.GetSecret(ctx, donationLedgerSecret); err == nil && ok {
+				var stored DonationRewardLedger
+				if json.Unmarshal([]byte(raw), &stored) == nil {
+					if stored.Credentials != nil {
+						d.ledger.Credentials = stored.Credentials
+					}
+					if stored.Users != nil {
+						d.ledger.Users = stored.Users
+					}
+				}
+			}
+		}
+	}
+	// Return a copy so a caller cannot mutate the ledger off-lock.
+	out := DonationRewardLedger{
+		Credentials: make(map[string]DonationClaim, len(d.ledger.Credentials)),
+		Users:       make(map[string]int, len(d.ledger.Users)),
+	}
+	for k, v := range d.ledger.Credentials {
+		out.Credentials[k] = v
+	}
+	for k, v := range d.ledger.Users {
+		out.Users[k] = v
+	}
+	return out
+}
+
+// checkClaimable refuses a submission that has already been paid, or that would
+// exceed the per-user limit. It returns the fingerprint to record once the
+// reward is actually issued.
+func (d *Donations) checkClaimable(ctx context.Context, format string, payload []byte, userID int) (string, error) {
+	fingerprint := donationCredentialFingerprint(format, payload)
+	ledger := d.ledgerSnapshot(ctx)
+	if claim, ok := ledger.Credentials[fingerprint]; ok {
+		return fingerprint, operationError("credential_already_contributed",
+			fmt.Sprintf("this account has already been contributed (credited to user %d)", claim.NewAPIUserID))
+	}
+	if ledger.Users[strconv.Itoa(userID)] >= donationMaxRewardsPerUser {
+		return fingerprint, operationError("reward_limit_reached",
+			fmt.Sprintf("this user id has already received %d contribution rewards", donationMaxRewardsPerUser))
+	}
+	return fingerprint, nil
+}
+
+// recordClaim persists one payout so it cannot be claimed again.
+func (d *Donations) recordClaim(ctx context.Context, fingerprint string, claim DonationClaim) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.ledger == nil {
+		d.ledger = &DonationRewardLedger{
+			Credentials: map[string]DonationClaim{},
+			Users:       map[string]int{},
+		}
+	}
+	if fingerprint != "" {
+		d.ledger.Credentials[fingerprint] = claim
+	}
+	d.ledger.Users[strconv.Itoa(claim.NewAPIUserID)]++
+	if d.settings == nil {
+		return
+	}
+	if encoded, err := json.Marshal(d.ledger); err == nil {
+		_ = d.settings.SetSecret(ctx, donationLedgerSecret, string(encoded))
+	}
+}
+
+// verifyAccountLive proves a contributed account actually works before it is
+// rewarded.
+//
+// Credential validation is a local shape check (a non-empty token, a user_
+// prefix), so a fabricated credential passes it. Probe alone is not enough
+// either: for WorkBuddy, Trae and Codex it only re-reads the stored credential.
+// Quota is a real provider call for every adapter, so it is the liveness proof
+// used here. A provider that cannot be reached is treated as not live, because
+// paying for an account nobody can verify is the failure mode this guards.
+func (d *Donations) verifyAccountLive(ctx context.Context, providerID, accountID string) error {
+	adapter, ok := d.donationAdapter(providerID)
+	if !ok {
+		return operationError("provider_unsupported", "this provider is not available")
+	}
+	if adapter.Prober != nil {
+		// A probe that positively reports not-ready is authoritative.
+		if health, err := adapter.Prober.Probe(ctx, accountID); err == nil && !health.Ready && health.LastError != "" {
+			return operationError("account_not_live", "the account did not pass its provider check: "+health.LastError)
+		}
+	}
+	if adapter.Prober == nil {
+		return operationError("account_unverifiable", "this provider cannot verify a contributed account")
+	}
+	if _, err := adapter.Prober.Quota(ctx, accountID); err != nil {
+		return operationError("account_not_live", "the account could not be verified with its provider: "+err.Error())
+	}
+	return nil
 }
 
 // donationProvider maps a contribution format to its provider family.
@@ -622,6 +833,13 @@ func (d *Donations) StartSession(ctx context.Context, input DonationStart) (Dona
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
 		name = providerID + " donation"
+	}
+
+	// Refuse a user who has already collected the maximum number of rewards
+	// before creating anything, so a refused attempt leaves no placeholder.
+	if ledger := d.ledgerSnapshot(ctx); ledger.Users[strconv.Itoa(input.NewAPIUserID)] >= donationMaxRewardsPerUser {
+		return DonationSession{}, operationError("reward_limit_reached",
+			fmt.Sprintf("this user id has already received %d contribution rewards", donationMaxRewardsPerUser))
 	}
 
 	// Created enabled, matching the console wizard: a Qoder login needs the
@@ -862,6 +1080,23 @@ func (d *Donations) CancelSession(ctx context.Context, sessionID string) error {
 // which is what keeps a second poll from crediting again -- the caller claimed
 // the round by setting settling before calling this.
 func (d *Donations) settle(ctx context.Context, sessionID, accountID string, userID, quota int) {
+	// Prove the account works before paying for it. The provider login proves
+	// the credential exists, but not that it can actually serve; a reward is
+	// paid out of the operator's quota, so it waits for a real provider call.
+	providerID := ""
+	if record, ok := d.sessionRecord(sessionID); ok {
+		providerID = record.Provider
+	}
+	if providerID != "" {
+		if err := d.verifyAccountLive(ctx, providerID, accountID); err != nil {
+			// The account is not usable, so it must not stay in the pool.
+			_ = d.accounts.Delete(ctx, accountID)
+			d.finishSettle(ctx, sessionID, "failed", 0, err.Error(),
+				"the account could not be verified with its provider, so it was not added")
+			return
+		}
+	}
+
 	// Enable+boot so the authorized credential is actually in the pool.
 	enabled := true
 	if _, err := d.accounts.Update(ctx, accountID, accounts.UpdateAccount{Enabled: &enabled}); err != nil {
@@ -877,7 +1112,39 @@ func (d *Donations) settle(ctx context.Context, sessionID, accountID string, use
 			"account authorized and added, but the credit failed")
 		return
 	}
+	// Record the payout so this credential and this user cannot claim again.
+	d.recordClaim(ctx, d.sessionFingerprint(ctx, sessionID), DonationClaim{
+		NewAPIUserID: userID,
+		AccountID:    accountID,
+		Provider:     providerID,
+		ClaimedAt:    d.now(),
+	})
 	d.finishSettle(ctx, sessionID, "credited", quota, "", "authorized and credited")
+}
+
+// sessionRecord reads one session without holding the lock afterwards.
+func (d *Donations) sessionRecord(sessionID string) (DonationSession, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	record, ok := d.sessionStore()[sessionID]
+	if !ok {
+		return DonationSession{}, false
+	}
+	return *record, true
+}
+
+// sessionFingerprint is the credential fingerprint for a settled web-auth round,
+// computed from the credential the provider actually stored.
+func (d *Donations) sessionFingerprint(ctx context.Context, sessionID string) string {
+	record, ok := d.sessionRecord(sessionID)
+	if !ok {
+		return ""
+	}
+	_, payload, err := d.accounts.store().LoadCredentialPayload(ctx, record.AccountID)
+	if err != nil || len(payload) == 0 {
+		return ""
+	}
+	return donationCredentialFingerprint(record.Format, payload)
 }
 
 // finishSettle commits one settle outcome and releases the claim. The outcome is

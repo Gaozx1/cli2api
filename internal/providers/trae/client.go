@@ -1061,7 +1061,13 @@ func Classify(status int, body string) providers.ClassifiedError {
 	case code == "1005" || (strings.Contains(text, "1005") && strings.Contains(text, "plan")):
 		return providers.ClassifiedError{Kind: accounts.KindQuota, Status: 429, Message: firstNonEmpty(strings.TrimSpace(body), "plan limit")}
 	case code == "4008":
-		return providers.ClassifiedError{Kind: accounts.KindQuota, Status: 429, Message: firstNonEmpty(strings.TrimSpace(body), "solo credits exhausted")}
+		// Solo's per-window request cap: "Your requests have exceeded the quota."
+		// It is a volume limit, not an exhausted entitlement pack -- accounts hit
+		// it while still holding most of their credits, and it clears when the
+		// window rolls. Classifying it as hard quota parked such an account until
+		// local midnight (hours) and, with Failover=false, failed the whole round
+		// instead of moving on to the next account.
+		return providers.ClassifiedError{Kind: accounts.KindRateLimit, Status: 429, Message: firstNonEmpty(strings.TrimSpace(body), "solo request limit reached")}
 	case code == "4001":
 		return providers.ClassifiedError{Kind: accounts.KindInvalidRequest, Status: 400, Message: firstNonEmpty(strings.TrimSpace(body), "model or ide version mismatch")}
 	case code == "4011":

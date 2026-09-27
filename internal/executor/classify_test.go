@@ -135,6 +135,37 @@ func TestClassifyTraePlanLimitIsQuota(t *testing.T) {
 	}
 }
 
+// Trae 4008 is a per-window request cap, not an exhausted entitlement: accounts
+// hit it while still holding most of their credits. It must fail over and cool
+// briefly, not park the account until local midnight.
+func TestClassifyTraeRequestLimitIsFailover(t *testing.T) {
+	body := `{"code":4008,"message":"Your requests have exceeded the quota."}`
+	got := Classify(0, body, "", "", "")
+	if got.Kind != KindRateLimit {
+		t.Fatalf("kind=%s, want rate_limit (got %+v)", got.Kind, got)
+	}
+	if !got.Failover {
+		t.Fatalf("a per-window request cap must fail over to another account: %+v", got)
+	}
+	if got.Cooldown <= 0 || got.Cooldown > time.Hour {
+		t.Fatalf("cooldown=%v, want a short one, not until midnight", got.Cooldown)
+	}
+}
+
+// The provider classifier is authoritative for 4008: even though the executor
+// sees a "quota" phrase, it must not be re-promoted to hard quota.
+func TestClassifyTraeRequestLimitNotPromotedToQuota(t *testing.T) {
+	for _, body := range []string{
+		`{"code":4008,"message":"Your requests have exceeded the quota."}`,
+		`{"code":"4008"}`,
+	} {
+		got := Classify(0, body, "", "", "")
+		if got.Kind == KindQuota {
+			t.Fatalf("body %s was promoted to hard quota: %+v", body, got)
+		}
+	}
+}
+
 func TestClassifyContentScreeningStaysRequestLevel(t *testing.T) {
 	for _, body := range []string{"sensitive content rejected", "内容包含敏感信息"} {
 		got := Classify(400, body, "", "", "")

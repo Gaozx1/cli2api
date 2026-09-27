@@ -47,7 +47,14 @@ func donationImportHarness(t *testing.T, format string, importer *fakeDonationIm
 	runtime := &fakeRuntime{log: log, store: store}
 	accountsSvc := NewAccounts(runtime)
 	registry := providers.NewRegistry()
-	registry.Register(providers.Adapter{ID: "workbuddy", Credential: importer})
+	// A prober is registered too: submitting a credential now requires proving
+	// the account is live, and these tests are about pricing and the host strip,
+	// not about the liveness gate (which has its own tests).
+	registry.Register(providers.Adapter{
+		ID:         "workbuddy",
+		Credential: importer,
+		Prober:     &fakeProber{ready: true},
+	})
 	accountsSvc.Providers = registry
 	return &Donations{
 		settings: NewSettings(store),
