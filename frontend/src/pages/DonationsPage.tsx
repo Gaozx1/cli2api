@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { Button, Card, Chip, Input, Label, ListBox, Select, TextArea } from '@heroui/react'
 import { CheckCircle, HandHeart, Warning } from '@phosphor-icons/react'
 import { useI18n } from '@/hooks/useI18n'
@@ -46,6 +47,8 @@ function parseJSONCredential(raw: string): { value?: unknown; error?: string } {
 
 export function DonationsPage() {
   const { t } = useI18n()
+  const location = useLocation()
+  const navigate = useNavigate()
   const [info, setInfo] = useState<DonationInfo | null>(null)
   const [infoError, setInfoError] = useState('')
   const [formatID, setFormatID] = useState('')
@@ -62,6 +65,25 @@ export function DonationsPage() {
   const [machineID, setMachineID] = useState('')
   const timer = useRef<number | null>(null)
   const cancelled = useRef(false)
+
+  // A contribution link can carry the contributor's New API user id, so an
+  // operator can hand out http://host/donations?uid=123 and the field arrives
+  // filled in. The id is locked (the contributor must not silently credit
+  // someone else), and the query string is stripped from the address bar right
+  // away so the link reads as a plain /donations afterwards.
+  const presetUID = useMemo(() => {
+    const raw = new URLSearchParams(location.search).get('uid') ?? ''
+    const value = Number.parseInt(raw.trim(), 10)
+    return Number.isFinite(value) && value > 0 ? String(value) : ''
+  }, [location.search])
+
+  useEffect(() => {
+    if (!presetUID) return
+    setUserID(presetUID)
+    if (location.search) {
+      navigate('/donations', { replace: true })
+    }
+  }, [presetUID, location.search, navigate])
 
   useEffect(() => {
     let active = true
@@ -352,14 +374,14 @@ export function DonationsPage() {
             </Select>
           </FormRow>
 
-          <FormRow label={t('donations.fieldUserID')} hint={t('donations.fieldUserIDHint')} htmlFor="donation-user-id">
+          <FormRow label={t('donations.fieldUserID')} hint={presetUID ? t('donations.fieldUserIDLocked') : t('donations.fieldUserIDHint')} htmlFor="donation-user-id">
             <Input
               id="donation-user-id"
               fullWidth
               inputMode="numeric"
               value={userID}
               placeholder="1"
-              disabled={busy}
+              disabled={busy || Boolean(presetUID)}
               onChange={(event) => setUserID(event.target.value)}
             />
           </FormRow>

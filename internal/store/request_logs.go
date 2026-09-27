@@ -629,6 +629,37 @@ FROM request_attempts WHERE request_id = ? ORDER BY attempt_index ASC, started_a
 	return items, rows.Err()
 }
 
+// ListRecentAttempts returns the account's most recent attempts, newest first.
+// The content-review monitor reads this to decide whether an account has been
+// rejected by the provider on every recent call. limit is clamped to a sane
+// range so a caller cannot ask for the whole table.
+func (s *Store) ListRecentAttempts(ctx context.Context, accountID string, limit int) ([]accounts.RequestAttempt, error) {
+	if strings.TrimSpace(accountID) == "" {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, request_id, attempt_index, account_id, started_at, finished_at, status, http_status,
+       error_kind, error_message, latency_ms, prompt_tokens, completion_tokens, usage_source
+FROM request_attempts WHERE account_id = ?
+ORDER BY started_at DESC, id DESC LIMIT ?`, accountID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list recent attempts: %w", err)
+	}
+	defer rows.Close()
+	items := make([]accounts.RequestAttempt, 0, limit)
+	for rows.Next() {
+		item, err := scanRequestAttempt(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan recent attempt: %w", err)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
 func (s *Store) ClearRequestLogs(ctx context.Context) (int64, error) {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM request_logs`)
 	if err != nil {

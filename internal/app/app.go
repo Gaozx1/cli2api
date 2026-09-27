@@ -17,6 +17,7 @@ import (
 	"github.com/caigee-cmd/cli2api/internal/buildinfo"
 	"github.com/caigee-cmd/cli2api/internal/config"
 	appconsole "github.com/caigee-cmd/cli2api/internal/console"
+	"github.com/caigee-cmd/cli2api/internal/contentreview"
 	appsvc "github.com/caigee-cmd/cli2api/internal/control"
 	"github.com/caigee-cmd/cli2api/internal/executor"
 	apigateway "github.com/caigee-cmd/cli2api/internal/gateway"
@@ -156,6 +157,14 @@ func New(cfg config.Config) *App {
 	// contributor who walks away cannot leave a placeholder account behind.
 	if a.Control.Donations != nil {
 		go a.Control.Donations.RunSweepLoop(stopLogs)
+	}
+	// WorkBuddy answers a provider-side content ban with 11140 to every request,
+	// which the classifier reads as a request-level rejection (no cooldown, no
+	// failover), so a banned account keeps being picked and keeps failing. This
+	// monitor watches the call history and disables an account whose last 10
+	// calls were all content-review rejections.
+	if store != nil {
+		go contentreview.New(store, manager).RunSweepLoop(stopLogs)
 	}
 	// Auth copies and all executor copies read the same atomic live key.
 	// Cfg.ProxyAPIKey and Executor.WorkerKey remain bootstrap snapshots.

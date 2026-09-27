@@ -103,6 +103,8 @@ func (a *Accounts) ImportNative(ctx context.Context, input accounts.ImportAccoun
 		Name: input.Name, Provider: input.Provider, Region: input.Region, Enabled: false,
 		MaxInFlight: input.MaxInFlight, Priority: input.Priority, DropSystemPrompt: input.DropSystemPrompt,
 		WorkBuddyAutoCheckin: input.WorkBuddyAutoCheckin, WorkBuddyCheckinTime: input.WorkBuddyCheckinTime, ProxyURL: input.ProxyURL,
+		ContributedBy: input.ContributedBy, ContributedProvider: input.ContributedProvider,
+		ContributedRegion: input.ContributedRegion, ContributedFormat: input.ContributedFormat,
 	})
 	if err != nil {
 		return accounts.Account{}, err

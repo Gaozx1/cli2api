@@ -44,8 +44,15 @@ type Account struct {
 	LastErrorKind     string         `json:"last_error_kind,omitempty"`
 	CooldownUntil     *time.Time     `json:"cooldown_until,omitempty"`
 	Quota             *QuotaSnapshot `json:"-"`
-	CreatedAt         time.Time      `json:"created_at"`
-	UpdatedAt         time.Time      `json:"updated_at"`
+	// Contribution provenance. Zero/empty unless the account arrived through
+	// /donations, so the console can show which New API user contributed it and
+	// what was contributed.
+	ContributedBy       int       `json:"contributed_by,omitempty"`
+	ContributedProvider string    `json:"contributed_provider,omitempty"`
+	ContributedRegion   string    `json:"contributed_region,omitempty"`
+	ContributedFormat   string    `json:"contributed_format,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 type CreateAccount struct {
@@ -61,6 +68,12 @@ type CreateAccount struct {
 	WorkBuddyAutoCheckin *bool
 	WorkBuddyCheckinTime string
 	ProxyURL             string
+	// Contribution provenance, set by the donations flow when it creates the
+	// account for a credited contributor.
+	ContributedBy       int
+	ContributedProvider string
+	ContributedRegion   string
+	ContributedFormat   string
 }
 
 type UpdateAccount struct {
@@ -74,6 +87,17 @@ type UpdateAccount struct {
 	WorkBuddyAutoCheckin *bool
 	WorkBuddyCheckinTime *string
 	ProxyURL             *string
+	// LastErrorKind/LastError let a non-console writer (the content-review
+	// monitor) stamp why it changed an account, so the console shows the reason
+	// rather than a bare disabled flag.
+	LastErrorKind *string
+	LastError     *string
+	// Contribution provenance, set once when a donated account is accepted.
+	// Empty/zero for operator-created accounts.
+	ContributedBy       *int
+	ContributedProvider *string
+	ContributedRegion   *string
+	ContributedFormat   *string
 }
 
 type NativeCredential struct {
@@ -95,6 +119,11 @@ type ImportAccount struct {
 	WorkBuddyCheckinTime string
 	ProxyURL             string
 	Credential           NativeCredential
+	// Contribution provenance, forwarded by the donations flow.
+	ContributedBy       int
+	ContributedProvider string
+	ContributedRegion   string
+	ContributedFormat   string
 }
 
 type AccountView struct {

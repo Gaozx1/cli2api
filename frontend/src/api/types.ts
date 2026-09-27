@@ -170,6 +170,10 @@ export type Overview = {
     last_error?: string
     lastError?: string
     last_error_kind?: string
+    contributed_by?: number
+    contributed_provider?: string
+    contributed_region?: string
+    contributed_format?: string
     last_checkin_at?: string
     last_checkin_msg?: string
     last_checkin_status?: string

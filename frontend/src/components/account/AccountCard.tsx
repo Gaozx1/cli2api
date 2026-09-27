@@ -127,6 +127,12 @@ export function AccountCard({
   const provider = accountProviderLabel(account.provider, account.region, t)
   const checkinStatus = account.last_checkin_status
   const checkinLabel = checkinStatus === 'success' ? 'checkinRecordSuccess' : checkinStatus === 'already' ? 'checkinRecordAlready' : checkinStatus === 'skipped' ? 'checkinRecordSkipped' : checkinStatus === 'error' ? 'checkinRecordFailed' : 'lastCheckinNone'
+  // Contribution provenance: set only for accounts that arrived through the
+  // donations page, so an operator can see who contributed it and what.
+  const contributedBy = account.contributed_by
+  const contributedLabel = contributedBy
+    ? `${t('contributedBy')} #${contributedBy}${account.contributed_provider ? ` · ${account.contributed_provider}` : ''}${account.contributed_region ? ` ${account.contributed_region}` : ''}`
+    : ''
 
   useLayoutEffect(() => {
     const chip = chipRef.current
@@ -192,6 +198,16 @@ export function AccountCard({
             <div className="flex min-w-0 items-center gap-2">
               <Card.Title className="truncate text-[13px] leading-5 tracking-[-0.01em]">{account.name || account.id}</Card.Title>
               <span className="shrink-0 rounded-md bg-surface-secondary px-1.5 py-0.5 text-[10px] text-foreground/65">{provider}</span>
+              {contributedLabel ? (
+                <Tooltip>
+                  <Tooltip.Trigger>
+                    <span className="shrink-0 cursor-help rounded-md bg-primary/10 px-1.5 py-0.5 text-[10px] text-primary">{t('contributed')}</span>
+                  </Tooltip.Trigger>
+                  <Tooltip.Content>
+                    <div className="whitespace-nowrap">{contributedLabel}</div>
+                  </Tooltip.Content>
+                </Tooltip>
+              ) : null}
             </div>
             <Card.Description className="mono truncate text-[10px] leading-4 text-foreground/60" title={`${account.id}${account.remote_uid ? ` · UID ${account.remote_uid}` : ''}`}>
               {account.remote_uid ? `UID ${account.remote_uid}` : account.id}

@@ -25,6 +25,12 @@ type AccountImportInput struct {
 	UserBlob             string          `json:"user_blob"`
 	MachineID            string          `json:"machine_id"`
 	Credential           json.RawMessage `json:"credential"`
+	// Contribution provenance, set only by the donations flow. The console
+	// import path leaves these zero.
+	ContributedBy       int    `json:"contributed_by"`
+	ContributedProvider string `json:"contributed_provider"`
+	ContributedRegion   string `json:"contributed_region"`
+	ContributedFormat   string `json:"contributed_format"`
 }
 
 func (a *Accounts) Import(ctx context.Context, input AccountImportInput, raw []byte) (accounts.Account, error) {
@@ -38,7 +44,9 @@ func (a *Accounts) Import(ctx context.Context, input AccountImportInput, raw []b
 			Name: input.Name, Provider: input.Provider, Region: input.Region, Enabled: input.Enabled,
 			MaxInFlight: input.MaxInFlight, Priority: input.Priority, DropSystemPrompt: input.DropSystemPrompt,
 			WorkBuddyAutoCheckin: input.WorkBuddyAutoCheckin, WorkBuddyCheckinTime: input.WorkBuddyCheckinTime, ProxyURL: input.ProxyURL,
-			Credential: accounts.NativeCredential{UserBlob: blob, MachineID: input.MachineID},
+			Credential:    accounts.NativeCredential{UserBlob: blob, MachineID: input.MachineID},
+			ContributedBy: input.ContributedBy, ContributedProvider: input.ContributedProvider,
+			ContributedRegion: input.ContributedRegion, ContributedFormat: input.ContributedFormat,
 		})
 		if err != nil {
 			return account, operationError("account_import_failed", err.Error())
@@ -67,6 +75,8 @@ func (a *Accounts) Import(ctx context.Context, input AccountImportInput, raw []b
 			Name: input.Name, Provider: descriptor.ID, Region: input.Region,
 			MaxInFlight: input.MaxInFlight, Priority: input.Priority, DropSystemPrompt: input.DropSystemPrompt,
 			WorkBuddyAutoCheckin: input.WorkBuddyAutoCheckin, WorkBuddyCheckinTime: input.WorkBuddyCheckinTime, ProxyURL: input.ProxyURL,
+			ContributedBy: input.ContributedBy, ContributedProvider: input.ContributedProvider,
+			ContributedRegion: input.ContributedRegion, ContributedFormat: input.ContributedFormat,
 		}, input.Format, prepared.Payload, prepared.Ready && input.Enabled)
 		if err != nil {
 			return account, operationError("account_import_failed", err.Error())

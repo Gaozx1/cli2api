@@ -528,13 +528,17 @@ func (d *Donations) importAccount(ctx context.Context, providerID, region string
 	// accounts carry other people's traffic, so enabling is an operator action.
 	if input.Format == donationQoderFormat {
 		return d.accounts.Import(ctx, AccountImportInput{
-			Format:    input.Format,
-			Name:      name,
-			Provider:  providerID,
-			Region:    region,
-			Enabled:   false,
-			UserBlob:  strings.TrimSpace(input.UserBlob),
-			MachineID: strings.TrimSpace(input.MachineID),
+			Format:              input.Format,
+			Name:                name,
+			Provider:            providerID,
+			Region:              region,
+			Enabled:             false,
+			UserBlob:            strings.TrimSpace(input.UserBlob),
+			MachineID:           strings.TrimSpace(input.MachineID),
+			ContributedBy:       input.NewAPIUserID,
+			ContributedProvider: providerID,
+			ContributedRegion:   region,
+			ContributedFormat:   strings.TrimSpace(input.Format),
 		}, nil)
 	}
 
@@ -547,12 +551,16 @@ func (d *Donations) importAccount(ctx context.Context, providerID, region string
 		return accounts.Account{}, operationError("invalid_credential", err.Error())
 	}
 	return d.accounts.Import(ctx, AccountImportInput{
-		Format:     input.Format,
-		Name:       name,
-		Provider:   providerID,
-		Region:     region,
-		Enabled:    false,
-		Credential: sanitized,
+		Format:              input.Format,
+		Name:                name,
+		Provider:            providerID,
+		Region:              region,
+		Enabled:             false,
+		Credential:          sanitized,
+		ContributedBy:       input.NewAPIUserID,
+		ContributedProvider: providerID,
+		ContributedRegion:   region,
+		ContributedFormat:   strings.TrimSpace(input.Format),
 	}, sanitized)
 }
 
@@ -871,6 +879,12 @@ func (d *Donations) StartSession(ctx context.Context, input DonationStart) (Dona
 	// enabling it is an operator decision.
 	created, err := d.accounts.Create(ctx, accounts.CreateAccount{
 		Name: name, Provider: providerID, Region: region, Enabled: true,
+		// Provenance, so the console can show which New API user contributed
+		// this account and what they contributed.
+		ContributedBy:       input.NewAPIUserID,
+		ContributedProvider: providerID,
+		ContributedRegion:   region,
+		ContributedFormat:   strings.TrimSpace(input.Format),
 	})
 	if err != nil {
 		return DonationSession{}, operationError("account_create_failed", err.Error())
