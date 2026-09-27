@@ -28,6 +28,17 @@ func Classify(status int, body string) providers.ClassifiedError {
 	safeBody := redactSecrets(strings.TrimSpace(body))
 	text := strings.ToLower(safeBody)
 	switch {
+	// A 5xx is the upstream failing, whatever words the body contains. Devin
+	// reports its own faults under caller-facing codes -- "permission_denied: an
+	// internal error occurred (trace ID: ...)" -- so matching on the code text
+	// below would drag a server fault back to invalid_request, and a request-level
+	// verdict neither fails over nor cools the account. This case must come first.
+	case status >= 500:
+		return providers.ClassifiedError{
+			Kind:    accounts.KindUnavailable,
+			Status:  firstNonEmptyStatus(status, 502),
+			Message: firstNonEmpty(safeBody, "upstream unavailable"),
+		}
 	case isDevinMCPConfigDenial(text):
 		// Codex/Desktop MCP tool dumps make Devin return permission_denied.
 		// That is a request-shape problem, not a dead session — do not cool

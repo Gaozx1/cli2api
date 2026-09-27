@@ -1,0 +1,9 @@
+### English
+
+- A provider's internal failure is no longer reported as a problem with your request. Devin answers some of its own faults under `permission_denied` ("permission_denied: an internal error occurred (trace ID: ...)"); that code was mapped to 403 and then classified as `invalid_request`, which neither fails over nor cools the account, so every request bounced off the same broken upstream forever. An upstream 5xx is now treated as an upstream fault whatever the body says, and a `permission_denied` trailer carrying an internal-error message maps to 502. A genuine permission denial — including the MCP-configuration one — keeps its request-level handling. Devin's three accounts cannot be recovered by this change (their sessions are valid but the upstream chat endpoint fails on every request), so they must be contributed again; the change means such an account now cools and stops consuming attempts instead of being retried indefinitely.
+- Also fixed: a rate-limit cooldown could be stretched to 15 hours by an upstream reset time. A provider's own retry hint bypassed both the retry-after cap and the 6-hour backoff ceiling, and WorkBuddy reports the usage window's absolute reset instant as that hint. It is now capped like any other, so a long or stale reset costs one capped wait and the account is retried.
+
+### 中文
+
+- 平台自身的故障不再被报成"你的请求有问题"。Devin 会把一些**自己的故障**用 `permission_denied` 返回（"permission_denied: an internal error occurred (trace ID: ...)"）；该码被映射为 403，进而归类为 `invalid_request`——既不切换也不冷却，于是每个请求都一直撞同一个坏上游。现在**上游 5xx 一律按上游故障处理**（不论正文写什么），带内部错误信息的 `permission_denied` 映射为 502。真正的权限拒绝（含 MCP 配置问题那种）保持请求级处理不变。Devin 那三个账号无法靠本次改动恢复（会话有效但聊天端点每次都服务端失败），需要重新贡献；改动后这类账号会冷却、不再无限消耗尝试，而不是被反复重试。
+- 同时修复：限流冷却曾被上游重置时间拉长到 15 小时。provider 自己报的重试提示**同时绕过了重试上限和 6 小时退避上限**，而 WorkBuddy 会把额度窗口的绝对重置时刻当提示返回。现在与其他提示一样受上限约束，过长或过期的重置时间最多只代价一次封顶等待，之后账号会被重试。

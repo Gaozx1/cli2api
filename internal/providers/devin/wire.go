@@ -390,7 +390,7 @@ func ParseTrailerError(payload []byte) (statusCode int, err error) {
 	httpCode := http.StatusBadGateway
 	switch codeStr {
 	case "invalid_argument":
-		if strings.Contains(msgLower, "internal error") {
+		if isInternalErrorMessage(msgLower) {
 			httpCode = http.StatusBadGateway
 		} else {
 			httpCode = http.StatusBadRequest
@@ -400,7 +400,20 @@ func ParseTrailerError(payload []byte) (statusCode int, err error) {
 	case "unauthenticated":
 		httpCode = http.StatusUnauthorized
 	case "permission_denied":
-		httpCode = http.StatusForbidden
+		// permission_denied is normally the caller's problem (a request shape the
+		// account may not use), which is why it maps to 403 -> invalid_request and
+		// deliberately does not cool the account. But Devin also reports its OWN
+		// faults under this code: "permission_denied: an internal error occurred
+		// (trace ID: ...)" is the server saying it failed, not a verdict on the
+		// request. Mapping that to 403 made every request bounce off the same
+		// broken upstream without ever failing over or cooling, so it must be an
+		// upstream error instead. Only the wording distinguishes the two, so match
+		// on it -- the same way invalid_argument above already does.
+		if isInternalErrorMessage(msgLower) {
+			httpCode = http.StatusBadGateway
+		} else {
+			httpCode = http.StatusForbidden
+		}
 	case "resource_exhausted":
 		httpCode = http.StatusTooManyRequests
 	case "unavailable":
@@ -421,6 +434,23 @@ func ParseTrailerError(payload []byte) (statusCode int, err error) {
 		}
 	}
 	return httpCode, fmt.Errorf("devin upstream error (%s): %s", trailer.Error.Code, trailer.Error.Message)
+}
+
+// isInternalErrorMessage distinguishes an upstream fault that Devin happens to
+// report under a caller-facing code (permission_denied, invalid_argument) from a
+// genuine rejection of the request. The code alone is not enough: the message is
+// what says the server failed.
+func isInternalErrorMessage(msgLower string) bool {
+	for _, marker := range []string{
+		"internal error",
+		"internal server error",
+		"an internal error occurred",
+	} {
+		if strings.Contains(msgLower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func BasicAuthHeader(sessionToken string) string {
