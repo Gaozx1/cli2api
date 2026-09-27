@@ -13,6 +13,7 @@ import { LoginPage } from '@/pages/LoginPage'
 import { SystemPage } from '@/pages/SystemPage'
 import { LogsPage } from '@/pages/LogsPage'
 import { KeysPage } from '@/pages/KeysPage'
+import { DonationsPage } from '@/pages/DonationsPage'
 
 export default function App() {
   return (
@@ -23,6 +24,9 @@ export default function App() {
             <BrowserRouter>
               <Routes>
                 <Route path="/login" element={<LoginPage />} />
+                {/* Donations are public: a contributor has no console key, and
+                    the reward is credited to their own New API user id. */}
+                <Route path="/donations" element={<DonationsPage />} />
                 <Route element={<RequireAuth />}>
                   <Route element={<AppLayout />}>
                     <Route path="/" element={<OverviewPage />} />
