@@ -70,13 +70,14 @@ const (
 // before the pending account is swept. The provider login must finish inside it.
 const donationSessionTTL = 15 * time.Minute
 
-// donationDefaultUSD is the reward when the caller does not specify one.
+// donationDefaultUSD is the reward for one accepted contribution.
+//
+// It is server policy, not client input. The public endpoints still accept a
+// reward field for compatibility, but it is ignored: the reward is paid out of
+// the operator's own New API quota, so a caller never gets to price its own
+// payout. Changing the amount is a code change (later, a system setting), never
+// something a request can influence.
 const donationDefaultUSD = 1.0
-
-// donationMaxUSD caps a single reward. The endpoints that reach it are public
-// and unauthenticated, and the reward is paid out of the operator's own New API
-// quota, so the caller must never be able to name an arbitrary amount.
-const donationMaxUSD = 50.0
 
 // donationSettledRetention bounds how long a finished session stays in memory so
 // its outcome can still be reported. Pending sessions use donationSessionTTL.
@@ -133,11 +134,13 @@ func donationSettled(record *DonationSession) bool {
 
 // DonationStart is the input for beginning a web-authorized contribution.
 type DonationStart struct {
-	Format       string  `json:"format"`
-	Name         string  `json:"name"`
-	Region       string  `json:"region"`
-	NewAPIUserID int     `json:"newapi_user_id"`
-	CreditUSD    float64 `json:"credit_usd"`
+	Format       string `json:"format"`
+	Name         string `json:"name"`
+	Region       string `json:"region"`
+	NewAPIUserID int    `json:"newapi_user_id"`
+	// CreditUSD is accepted for compatibility and ignored: the reward is server
+	// policy (donationDefaultUSD).
+	CreditUSD float64 `json:"credit_usd"`
 }
 
 // DonationCredential is the input for a pasted-credential contribution.
@@ -154,7 +157,8 @@ type DonationRequest struct {
 	Region string `json:"region"`
 	// NewAPIUserID is the contributor's numeric New API user id.
 	NewAPIUserID int `json:"newapi_user_id"`
-	// CreditUSD is the reward in USD. Zero means the server default.
+	// CreditUSD is accepted for compatibility and ignored; the reward is server
+	// policy (donationDefaultUSD). It used to be the caller's number to pick.
 	CreditUSD float64 `json:"credit_usd"`
 	// Credential carries the provider payload. For WorkBuddy this is the
 	// canonical flat credential; for qoder the raw user blob and machine id.
@@ -212,23 +216,12 @@ func QuotaForUSD(usd float64) int {
 	return int(usd*donationQuotaPerUSD + 0.5)
 }
 
-// normalizeDonationUSD resolves the requested reward: the default when the
-// caller omitted it, an error above donationMaxUSD.
+// donationRewardUSD is the reward for one accepted contribution.
 //
-// Both donation entry points are public, and this value is what gets added to a
-// New API account straight from the operator's own quota, so the cap is applied
-// before the account is created rather than at the edge.
-func normalizeDonationUSD(usd float64) (float64, error) {
-	if usd <= 0 {
-		return donationDefaultUSD, nil
-	}
-	if usd > donationMaxUSD {
-		return 0, operationError(
-			"invalid_credit_usd",
-			fmt.Sprintf("credit_usd must not exceed %.0f", donationMaxUSD),
-		)
-	}
-	return usd, nil
+// Server policy, never the caller's credit_usd. Both entry points read it from
+// here so the amount has a single home should it ever become a setting.
+func donationRewardUSD() float64 {
+	return donationDefaultUSD
 }
 
 // creditQuota adds quota to one New API user.
@@ -302,12 +295,9 @@ func (d *Donations) Submit(ctx context.Context, input DonationRequest) (Donation
 		region = defaultDonationRegion(providerID)
 	}
 
-	// Validate the reward before importing: a rejected reward must not leave a
-	// contributed account behind.
-	usd, err := normalizeDonationUSD(input.CreditUSD)
-	if err != nil {
-		return DonationResult{}, err
-	}
+	// The reward is priced here, not by the caller: credit_usd is accepted and
+	// ignored, so a rejected or absurd value cannot influence the payout.
+	usd := donationRewardUSD()
 
 	created, err := d.importAccount(ctx, providerID, region, input)
 	if err != nil {
@@ -489,10 +479,7 @@ func (d *Donations) StartSession(ctx context.Context, input DonationStart) (Dona
 	if region == "" {
 		region = defaultDonationRegion(providerID)
 	}
-	usd, err := normalizeDonationUSD(input.CreditUSD)
-	if err != nil {
-		return DonationSession{}, err
-	}
+	usd := donationRewardUSD()
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
 		name = providerID + " donation"

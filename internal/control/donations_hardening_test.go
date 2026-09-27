@@ -3,6 +3,8 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -80,48 +82,62 @@ func TestStripDonationCredentialHostsRemovesUpstreamOverrides(t *testing.T) {
 	}
 }
 
-// The reward is paid out of the operator's own quota by an endpoint anyone can
-// reach, so an amount above the cap must be refused before anything is imported.
-func TestSubmitRefusesRewardAboveCap(t *testing.T) {
-	importer := &fakeDonationImporter{format: "workbuddy-oauth-v1"}
-	donations, store := donationImportHarness(t, "workbuddy-oauth-v1", importer)
+// The caller does not price its own payout: credit_usd is accepted for
+// compatibility and ignored, and the amount that reaches the donation site is
+// the server's.
+func TestSubmitIgnoresCallerSuppliedReward(t *testing.T) {
+	var gotBody string
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer site.Close()
 
-	_, err := donations.Submit(context.Background(), DonationRequest{
+	importer := &fakeDonationImporter{format: "workbuddy-oauth-v1"}
+	donations, _ := donationImportHarness(t, "workbuddy-oauth-v1", importer)
+	donations.HTTP = site.Client()
+	donations.BaseURL = site.URL
+	donations.Token = "t"
+
+	result, err := donations.Submit(context.Background(), DonationRequest{
 		Format:       "workbuddy-oauth-v1",
 		NewAPIUserID: 7,
-		CreditUSD:    donationMaxUSD + 1,
+		CreditUSD:    1000000,
 		Credential:   json.RawMessage(`{"access_token":"t"}`),
 	})
-	if err == nil {
-		t.Fatal("a reward above the cap must be refused")
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
 	}
-	if !strings.Contains(err.Error(), "credit_usd") {
-		t.Fatalf("the error should name the field, got %v", err)
+	if result.CreditedUSD != donationDefaultUSD {
+		t.Fatalf("credited_usd = %v, want the server amount %v", result.CreditedUSD, donationDefaultUSD)
 	}
-	if len(store.accounts) != 0 {
-		t.Fatalf("a refused reward must not import an account, got %d", len(store.accounts))
+	if result.CreditedQuota != QuotaForUSD(donationDefaultUSD) {
+		t.Fatalf("credited_quota = %d, want %d", result.CreditedQuota, QuotaForUSD(donationDefaultUSD))
 	}
-	if importer.payload() != nil {
-		t.Fatal("the importer must not run for a refused reward")
+	want := fmt.Sprintf(`"value":%d`, QuotaForUSD(donationDefaultUSD))
+	if !strings.Contains(gotBody, want) {
+		t.Fatalf("the credit request did not carry the server amount %s: %s", want, gotBody)
 	}
 }
 
-// Same cap on the web-authorization entry point, which must not leave a
-// placeholder account behind either.
-func TestStartSessionRefusesRewardAboveCap(t *testing.T) {
+// The web-authorization entry point ignores it too, and reports the server
+// amount back to the page.
+func TestStartSessionIgnoresCallerSuppliedReward(t *testing.T) {
 	login := &fakeLogin{authURL: "https://provider.example/auth"}
-	donations, store, _ := donationHarness(t, login, nil)
+	donations, _, _ := donationHarness(t, login, nil)
 
-	_, err := donations.StartSession(context.Background(), DonationStart{
+	session, err := donations.StartSession(context.Background(), DonationStart{
 		Format:       "workbuddy-oauth-v1",
 		NewAPIUserID: 7,
-		CreditUSD:    donationMaxUSD + 1,
+		CreditUSD:    1000000,
 	})
-	if err == nil {
-		t.Fatal("a reward above the cap must be refused")
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
 	}
-	if len(store.accounts) != 0 {
-		t.Fatalf("a refused reward must not create a placeholder, got %d", len(store.accounts))
+	if session.CreditUSD != donationDefaultUSD {
+		t.Fatalf("session credit_usd = %v, want %v", session.CreditUSD, donationDefaultUSD)
 	}
 }
 
