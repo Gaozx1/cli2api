@@ -185,9 +185,12 @@ func (h *Handler) writeDonationInfo(w http.ResponseWriter) {
 		writeErr(w, http.StatusServiceUnavailable, "donations_unavailable", "donations are not available")
 		return
 	}
+	// Report the same reward the payout uses, so the page cannot advertise one
+	// amount while the ledger pays another.
+	rewardUSD := control.DonationRewardUSD()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object":        "donation_info",
-		"default_usd":   1,
+		"default_usd":   rewardUSD,
 		"quota_per_usd": control.QuotaForUSD(1),
 		"formats":       donations.Formats(),
 	})

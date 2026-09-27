@@ -151,8 +151,10 @@ func TestPollSessionCreditsOnCompletion(t *testing.T) {
 	if done.Status != "credited" || !done.Credited {
 		t.Fatalf("settled session = %+v, want credited", done)
 	}
-	if done.CreditedQuota != 500000 {
-		t.Fatalf("credited quota = %d, want 500000", done.CreditedQuota)
+	// Assert against the policy constant, not a literal: the payout amount is
+	// meant to change, and a hardcoded expectation would break on every change.
+	if want := QuotaForUSD(donationDefaultUSD); done.CreditedQuota != want {
+		t.Fatalf("credited quota = %d, want %d", done.CreditedQuota, want)
 	}
 	if hits != 1 {
 		t.Fatalf("credit hits = %d, want 1", hits)

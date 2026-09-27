@@ -170,7 +170,14 @@ const donationSessionTTL = 15 * time.Minute
 // the operator's own New API quota, so a caller never gets to price its own
 // payout. Changing the amount is a code change (later, a system setting), never
 // something a request can influence.
-const donationDefaultUSD = 1.0
+const donationDefaultUSD = 0.5
+
+// DonationRewardUSD is the reward for one accepted contribution, exported so the
+// console reports the same number the payout actually uses. When the two drifted
+// apart the page advertised one amount while the ledger paid another.
+func DonationRewardUSD() float64 {
+	return donationDefaultUSD
+}
 
 // donationSettledRetention bounds how long a finished session stays in memory so
 // its outcome can still be reported. Pending sessions use donationSessionTTL.
@@ -317,7 +324,7 @@ func QuotaForUSD(usd float64) int {
 // Server policy, never the caller's credit_usd. Both entry points read it from
 // here so the amount has a single home should it ever become a setting.
 func donationRewardUSD() float64 {
-	return donationDefaultUSD
+	return DonationRewardUSD()
 }
 
 // creditQuota adds quota to one New API user.

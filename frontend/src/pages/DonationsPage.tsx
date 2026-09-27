@@ -27,6 +27,10 @@ type Phase = 'idle' | 'starting' | 'waiting' | 'done' | 'error'
 const QODER_NATIVE = 'qoder_native'
 const POLL_INTERVAL = 2500
 const POLL_ATTEMPTS = 120 // ~5 minutes, matching the pending-session TTL
+// Shown only until the info request lands, and only as a unit symbol for a
+// ratio: the real amount is always the server's default_usd, so the payout and
+// this label cannot drift apart when the reward changes.
+const FALLBACK_REWARD_USD = 1
 
 // formatKey identifies a selectable entry. One provider can be offered in more
 // than one region (Qoder global+cn, WorkBuddy cn+global), so the provider alone
@@ -68,9 +72,10 @@ export function DonationsPage() {
 
   // A contribution link can carry the contributor's New API user id, so an
   // operator can hand out http://host/donations?uid=123 and the field arrives
-  // filled in. The id is locked (the contributor must not silently credit
-  // someone else), and the query string is stripped from the address bar right
-  // away so the link reads as a plain /donations afterwards.
+  // filled in. The value is only a PREFILL: the field stays editable, because
+  // it is the contributor's own payout target and they may need to correct it.
+  // The query string is stripped from the address bar right away so the link
+  // reads as a plain /donations afterwards.
   const presetUID = useMemo(() => {
     const raw = new URLSearchParams(location.search).get('uid') ?? ''
     const value = Number.parseInt(raw.trim(), 10)
@@ -117,7 +122,7 @@ export function DonationsPage() {
   )
   const webAuth = Boolean(selected?.web_auth)
   const needsCallback = Boolean(session?.callback_required ?? selected?.callback_required)
-  const rewardUSD = info?.default_usd ?? 1
+  const rewardUSD = info?.default_usd ?? FALLBACK_REWARD_USD
   const rewardQuota = info?.quota_per_usd ?? 0
 
   function numericUserID(): number | null {
@@ -374,14 +379,14 @@ export function DonationsPage() {
             </Select>
           </FormRow>
 
-          <FormRow label={t('donations.fieldUserID')} hint={presetUID ? t('donations.fieldUserIDLocked') : t('donations.fieldUserIDHint')} htmlFor="donation-user-id">
+          <FormRow label={t('donations.fieldUserID')} hint={t('donations.fieldUserIDHint')} htmlFor="donation-user-id">
             <Input
               id="donation-user-id"
               fullWidth
               inputMode="numeric"
               value={userID}
               placeholder="1"
-              disabled={busy || Boolean(presetUID)}
+              disabled={busy}
               onChange={(event) => setUserID(event.target.value)}
             />
           </FormRow>
