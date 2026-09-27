@@ -117,11 +117,36 @@ func allowedProvidersFrom(ctx context.Context) []string {
 	return providers
 }
 
-func requestContextDone(ctx context.Context, err error) bool {
+// requestContextCanceled reports whether a transport error means the CALLER
+// gave up, as opposed to the upstream being too slow.
+//
+// The distinction is load-bearing. A child-process account (Qoder) that has
+// wedged never answers, so every request routed to it burns the full client
+// timeout. Worse, the stale attempt keeps the worker's in-flight slot held, so
+// even an operator hitting /health waits for a slot and sees it time out too.
+// Swallowing that as "client canceled" skipped MarkClassified entirely, so the
+// account was never cooled down or failed over: the next request paid the same
+// timeout again -- measured as an hour of every Qoder request costing 120s.
+//
+// So: a caller-side cancellation is ignored, and a timeout with a live caller
+// context is a real failure that must be classified and backed off.
+func requestContextCanceled(ctx context.Context, err error) bool {
 	if err == nil {
 		return false
 	}
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || (ctx != nil && ctx.Err() != nil)
+	// The caller's own context is done: they disconnected or gave up waiting.
+	// There is nothing to record and no one to fail over for.
+	if ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	// A bare cancellation with a live caller context is still the caller's doing.
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	// A deadline with a live caller context is the HTTP client's OWN timeout
+	// (http.Client.Timeout): the upstream took too long. That is this account's
+	// failure, not the caller's, so it falls through to be classified.
+	return false
 }
 
 const (
@@ -497,7 +522,7 @@ func isInProcessItem(item Item) bool {
 // impossible at that point (bytes are on the wire), so this only records the
 // classified state for the next request's scheduling.
 func (e ChatExecutor) ObserveStreamFailure(accountID string, err error, model string) {
-	if e.Pool == nil || accountID == "" || err == nil || requestContextDone(nil, err) {
+	if e.Pool == nil || accountID == "" || err == nil || requestContextCanceled(nil, err) {
 		return
 	}
 	classified := e.classifyInProcessError(err)
@@ -741,7 +766,7 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 				return result, nil
 			}
 			loop.lastErr = err
-			if requestContextDone(ctx, err) {
+			if requestContextCanceled(ctx, err) {
 				return ChatResult{AttemptCount: i + 1, AccountID: item.ID, Provider: item.Provider}, err
 			}
 			if loop.canFailover(classified) {
@@ -758,7 +783,7 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 		started := time.Now()
 		resp, err := e.HTTPClient.Do(httpReq)
 		if err != nil {
-			if requestContextDone(ctx, err) {
+			if requestContextCanceled(ctx, err) {
 				latency := int(time.Since(started).Milliseconds())
 				e.recordAttempt(ctx, accounts.RequestAttempt{
 					AttemptIndex: i, AccountID: item.ID, StartedAt: started, FinishedAt: ptrTime(time.Now().UTC()),
@@ -871,7 +896,7 @@ func (e ChatExecutor) chatInProcessNonStreamAttempt(ctx context.Context, item It
 		logResolvedReasoning(ctx, "chat_non_stream", item, req.Model, outcome.ReasoningLevel)
 	}
 	if err != nil {
-		if requestContextDone(ctx, err) {
+		if requestContextCanceled(ctx, err) {
 			return ChatResult{AccountID: item.ID, Provider: item.Provider}, Classified{Kind: accounts.KindUnavailable, Message: err.Error()}, err
 		}
 		classified := e.classifyInProcessError(err)
@@ -949,7 +974,7 @@ func (e ChatExecutor) chatInProcessStreamAttempt(ctx context.Context, item Item,
 		if errors.Is(err, providers.ErrUnsupported) {
 			return StreamResult{AccountID: item.ID, Provider: item.Provider}, Classified{Kind: accounts.KindInvalidRequest, Message: err.Error()}, err
 		}
-		if requestContextDone(ctx, err) {
+		if requestContextCanceled(ctx, err) {
 
 			return StreamResult{AccountID: item.ID, Provider: item.Provider}, Classified{Kind: accounts.KindUnavailable, Message: err.Error()}, err
 		}
@@ -1159,7 +1184,7 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 				return result, nil
 			}
 			loop.lastErr = err
-			if requestContextDone(ctx, err) {
+			if requestContextCanceled(ctx, err) {
 				return StreamResult{AttemptCount: i + 1, AccountID: item.ID, Provider: item.Provider}, err
 			}
 			if loop.canFailover(classified) {
@@ -1176,7 +1201,7 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 		started := time.Now()
 		resp, err := e.streamHTTPClient().Do(httpReq)
 		if err != nil {
-			if requestContextDone(ctx, err) {
+			if requestContextCanceled(ctx, err) {
 				latency := int(time.Since(started).Milliseconds())
 				e.recordAttempt(ctx, accounts.RequestAttempt{
 					AttemptIndex: i, AccountID: item.ID, StartedAt: started, FinishedAt: ptrTime(time.Now().UTC()),
