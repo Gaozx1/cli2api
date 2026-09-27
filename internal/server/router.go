@@ -33,6 +33,8 @@ func (s *Server) routes() {
 	// Donations stay public: a contributor has no console key, and the reward is
 	// credited to their own New API user id. See console.HandleDonations.
 	s.mux.HandleFunc("/api/donations", s.consoleHandler().HandleDonations)
+	s.mux.HandleFunc("/api/donations/credential", s.consoleHandler().HandleDonationCredential)
+	s.mux.HandleFunc("/api/donations/sessions/", s.consoleHandler().HandleDonationSession)
 	s.mux.HandleFunc(endpoint.ModelsPath, s.withAPIKey(s.gatewayHandler().HandleModels))
 	s.mux.HandleFunc(endpoint.ChatCompletionsPath, s.withAPIKey(s.gatewayHandler().HandleChatCompletions))
 	s.mux.HandleFunc(endpoint.MessagesPath, s.withAPIKey(s.gatewayHandler().HandleAnthropicMessages))
