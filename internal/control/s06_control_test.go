@@ -363,6 +363,9 @@ type fakeRuntime struct {
 	proxyURL    string
 	proxyAPIKey string
 	adminReq    providers.AdminRequest
+	// PersistCredential bookkeeping.
+	persistedCredential  string
+	persistCredentialErr error
 }
 
 func (r *fakeRuntime) StartAccount(_ context.Context, account accounts.Account) error {
@@ -438,6 +441,13 @@ func (r *fakeRuntime) WorkerAdmin(_ context.Context, input providers.AdminReques
 }
 func (r *fakeRuntime) Store() accounts.AccountStore {
 	return r.store
+}
+
+// PersistCredential records the call; the fake has no tmpfs home to read from.
+func (r *fakeRuntime) PersistCredential(_ context.Context, account accounts.Account) error {
+	r.log.add("runtime.PersistCredential")
+	r.persistedCredential = account.ID
+	return r.persistCredentialErr
 }
 
 func newTestServices() (*Services, *fakeRuntime, *fakeStore, *callLog) {

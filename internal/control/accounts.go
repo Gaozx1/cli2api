@@ -24,6 +24,9 @@ type Runtime interface {
 	ReloadProxyURL(ctx context.Context, value string) error
 	ReplaceProxyAPIKey(ctx context.Context, key string) error
 	WorkerAdmin(ctx context.Context, input providers.AdminRequest) (providers.AdminResponse, error)
+	// PersistCredential stores a child-process provider's login so it survives a
+	// restart; a no-op for in-process providers.
+	PersistCredential(ctx context.Context, account accounts.Account) error
 	Store() accounts.AccountStore
 }
 

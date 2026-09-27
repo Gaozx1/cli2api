@@ -66,6 +66,45 @@ func SyncCredential(ctx context.Context, store CredentialStore, account accounts
 	})
 }
 
+// SyncCredentialIfPresent stores the login the worker already wrote into its
+// home, and reports whether there was one to store.
+//
+// The worker home lives on tmpfs and is wiped on every restart, so a login that
+// only exists there is lost the moment the process restarts. MaterializeHome
+// restores a login from the store on startup; without a stored credential there
+// is nothing to restore, and the account comes back as "needs login" even though
+// it had been serving. That is exactly what happened to a contributed Qoder
+// account: it was authorized through the donations flow, served chat, and then
+// silently lost its login on the next restart because nothing had persisted it.
+//
+// Callers use this right after an authorization completes to make the login
+// survive. Absent files are not an error: an account that has not authorized yet
+// simply has nothing to save.
+func SyncCredentialIfPresent(ctx context.Context, store CredentialStore, account accounts.Account, home, authType string) (bool, error) {
+	authDir := AuthDir(home, account.ProviderRegion)
+	userBlob, err := os.ReadFile(filepath.Join(authDir, "user"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read qoder user credential: %w", err)
+	}
+	machineID, err := os.ReadFile(filepath.Join(authDir, "machine_id"))
+	if err != nil {
+		return false, fmt.Errorf("read qoder machine id: %w", err)
+	}
+	if len(userBlob) == 0 || strings.TrimSpace(string(machineID)) == "" {
+		return false, nil
+	}
+	if err := store.SaveCredential(ctx, account.ID, authType, accounts.NativeCredential{
+		UserBlob:  userBlob,
+		MachineID: string(machineID),
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 type RuntimePaths struct {
 	CLIPath   string
 	Site      string

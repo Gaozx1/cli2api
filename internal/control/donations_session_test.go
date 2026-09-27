@@ -121,7 +121,7 @@ func TestPollSessionCreditsOnCompletion(t *testing.T) {
 	var hits int32
 	site := creditSite(t, &hits)
 	login := &fakeLogin{authURL: "https://provider.example/auth"}
-	donations, store, _ := donationHarness(t, login, site)
+	donations, store, log := donationHarness(t, login, site)
 
 	session, err := donations.StartSession(context.Background(), DonationStart{
 		Format: "workbuddy-oauth-v1", NewAPIUserID: 7,
@@ -161,6 +161,19 @@ func TestPollSessionCreditsOnCompletion(t *testing.T) {
 	}
 	if !store.accounts[session.AccountID].Enabled {
 		t.Fatal("authorized account must be enabled")
+	}
+	// The credential must be persisted when the login completes: a child-process
+	// home lives on tmpfs, so a login that only exists in the worker is lost on
+	// the next restart and the account comes back needing a fresh login. That is
+	// exactly what happened to a contributed Qoder account.
+	persisted := false
+	for _, name := range log.names {
+		if name == "runtime.PersistCredential" {
+			persisted = true
+		}
+	}
+	if !persisted {
+		t.Fatalf("completing a donation must persist the credential, calls=%v", log.names)
 	}
 
 	// Polling again must not credit twice.

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -1019,6 +1020,17 @@ func (d *Donations) PollSession(ctx context.Context, sessionID string) (Donation
 	}
 
 	done, message, err := d.accounts.PollLogin(ctx, accountID)
+	if err == nil && done {
+		// The provider authorized the account. Persist the login now, while the
+		// worker that holds it is still running: a child-process home lives on
+		// tmpfs and is wiped on restart, so an unsaved login is lost and the
+		// account comes back needing a fresh one. Best-effort -- a failure here
+		// must not block a contribution that succeeded, and the settle step
+		// re-verifies the account anyway.
+		if err := d.accounts.PersistCredential(ctx, accountID); err != nil {
+			log.Printf("donation: persist credential for %s: %v", accountID, err)
+		}
+	}
 	if err != nil {
 		// The provider forgot this handshake — typically because the process
 		// restarted. Say so plainly so the page can offer a restart instead of

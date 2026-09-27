@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/caigee-cmd/cli2api/internal/accounts"
 	"github.com/caigee-cmd/cli2api/internal/providers"
 	"github.com/caigee-cmd/cli2api/internal/providers/qoder"
 )
@@ -274,6 +276,29 @@ func (m *Manager) SyncCredential(ctx context.Context, id, authType string) error
 	}
 	home := filepath.Join(m.config.DataDir, "runtime", id)
 	return qoder.SyncCredential(ctx, m.store, account, home, authType)
+}
+
+// PersistCredential persists a live child-process login, used after an
+// authorization completes so the credential is not lost when the tmpfs home is
+// wiped on the next restart. It is a no-op for in-process providers, whose
+// credential is already in the store.
+func (m *Manager) PersistCredential(ctx context.Context, account accounts.Account) error {
+	if m == nil {
+		return nil
+	}
+	descriptor, _, err := providers.Resolve(account.Provider, account.ProviderRegion)
+	if err != nil || descriptor.Runtime != providers.RuntimeChildProcess {
+		return nil
+	}
+	home := filepath.Join(m.config.DataDir, "runtime", account.ID)
+	saved, err := qoder.SyncCredentialIfPresent(ctx, m.store, account, home, "oauth")
+	if err != nil {
+		return err
+	}
+	if saved {
+		log.Printf("credential persisted account=%s provider=%s - survives restart", account.ID, account.Provider)
+	}
+	return nil
 }
 
 func (m *Manager) stopAccount(id string) error {

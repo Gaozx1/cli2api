@@ -8,6 +8,25 @@ import (
 	"github.com/caigee-cmd/cli2api/internal/providers"
 )
 
+// SyncCredential persists the login the worker already wrote into its home, so
+// it survives a restart.
+//
+// Child-process providers keep their home on tmpfs: MaterializeHome restores the
+// credential from the store on startup, so a login that was never stored is
+// simply gone after a restart. A contributed Qoder account hit exactly that --
+// authorized through /donations, serving chat, then "needs login" after a
+// restart because nothing had saved it.
+//
+// It is a no-op for in-process providers (their credential is already in the
+// store) and when the account has not authorized yet.
+func (a *Accounts) PersistCredential(ctx context.Context, id string) error {
+	account, err := a.GetStored(ctx, id)
+	if err != nil {
+		return err
+	}
+	return a.runtime.PersistCredential(ctx, account)
+}
+
 func (a *Accounts) login(ctx context.Context, id string) (providers.LoginSessionProvider, error) {
 	account, err := a.GetStored(ctx, id)
 	if err != nil {
