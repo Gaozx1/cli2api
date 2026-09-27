@@ -3,6 +3,8 @@ package control
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/accounts"
@@ -72,13 +73,32 @@ const donationSessionTTL = 15 * time.Minute
 // donationDefaultUSD is the reward when the caller does not specify one.
 const donationDefaultUSD = 1.0
 
-// donationSessionID returns an opaque id for one authorization round. It only
-// has to be unique within this process, since sessions are process-local.
-func donationSessionID() string {
-	return "don_" + strconv.FormatInt(time.Now().UnixNano(), 36) + strconv.FormatUint(nonce.Add(1), 36)
-}
+// donationMaxUSD caps a single reward. The endpoints that reach it are public
+// and unauthenticated, and the reward is paid out of the operator's own New API
+// quota, so the caller must never be able to name an arbitrary amount.
+const donationMaxUSD = 50.0
 
-var nonce atomic.Uint64
+// donationSettledRetention bounds how long a finished session stays in memory so
+// its outcome can still be reported. Pending sessions use donationSessionTTL.
+// Without this, a settled session -- one per completed contribution -- would
+// live forever, since the sweep only ever looked at pending ones.
+const donationSettledRetention = 24 * time.Hour
+
+// donationSessionID returns an opaque id for one authorization round.
+//
+// It is drawn from crypto/rand rather than composed from the clock: a session id
+// is the only thing standing between an anonymous caller and somebody else's
+// in-flight round, because GET reports the authorization URL (OAuth state
+// included) and DELETE abandons the round.
+func donationSessionID() string {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		// crypto/rand does not fail in practice; degrade to a clock-derived id
+		// rather than handing back a constant.
+		return "don_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return "don_" + hex.EncodeToString(buf[:])
+}
 
 // DonationSession is one in-flight web authorization: the contributed account
 // exists and is being authorized in the browser, but the reward is not credited
@@ -99,6 +119,16 @@ type DonationSession struct {
 	CreditedQuota int       `json:"credited_quota,omitempty"`
 	CreditError   string    `json:"credit_error,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
+
+	// settling marks a round whose settle path has been claimed. It is not part
+	// of the wire contract; it exists so two concurrent polls cannot both pay
+	// out. Guarded by Donations.mu.
+	settling bool
+}
+
+// donationSettled reports whether a round has reached a terminal state.
+func donationSettled(record *DonationSession) bool {
+	return record.Status == "credited" || record.Status == "failed"
 }
 
 // DonationStart is the input for beginning a web-authorized contribution.
@@ -182,6 +212,25 @@ func QuotaForUSD(usd float64) int {
 	return int(usd*donationQuotaPerUSD + 0.5)
 }
 
+// normalizeDonationUSD resolves the requested reward: the default when the
+// caller omitted it, an error above donationMaxUSD.
+//
+// Both donation entry points are public, and this value is what gets added to a
+// New API account straight from the operator's own quota, so the cap is applied
+// before the account is created rather than at the edge.
+func normalizeDonationUSD(usd float64) (float64, error) {
+	if usd <= 0 {
+		return donationDefaultUSD, nil
+	}
+	if usd > donationMaxUSD {
+		return 0, operationError(
+			"invalid_credit_usd",
+			fmt.Sprintf("credit_usd must not exceed %.0f", donationMaxUSD),
+		)
+	}
+	return usd, nil
+}
+
 // creditQuota adds quota to one New API user.
 //
 // New API validates /api/user/manage with the user AccessToken in the
@@ -253,15 +302,18 @@ func (d *Donations) Submit(ctx context.Context, input DonationRequest) (Donation
 		region = defaultDonationRegion(providerID)
 	}
 
+	// Validate the reward before importing: a rejected reward must not leave a
+	// contributed account behind.
+	usd, err := normalizeDonationUSD(input.CreditUSD)
+	if err != nil {
+		return DonationResult{}, err
+	}
+
 	created, err := d.importAccount(ctx, providerID, region, input)
 	if err != nil {
 		return DonationResult{}, err
 	}
 
-	usd := input.CreditUSD
-	if usd <= 0 {
-		usd = 1
-	}
 	quota := QuotaForUSD(usd)
 
 	result := DonationResult{
@@ -283,6 +335,55 @@ func (d *Donations) Submit(ctx context.Context, input DonationRequest) (Donation
 	return result, nil
 }
 
+// donationStrippedCredentialFields are credential fields that select the host a
+// provider talks to. Providers accept them so an operator can point an account
+// at a non-default endpoint (command/client.go, devin/client.go,
+// trae/client.go all prefer the credential value over their constant).
+//
+// A contributed credential is untrusted input, and once the account is enabled
+// the pool routes other people's requests through it, so a contributor must not
+// be able to name that host.
+var donationStrippedCredentialFields = map[string]struct{}{
+	"base_url": {},
+	"baseUrl":  {},
+	"api_host": {},
+	"apiHost":  {},
+}
+
+// stripDonationCredentialHosts removes upstream-host overrides from a
+// contributed credential. Providers read them at the top level and, for Trae,
+// nested under "auth", so the walk is recursive. A payload that is not a JSON
+// object is returned untouched and left to the provider importer to reject.
+func stripDonationCredentialHosts(payload []byte) ([]byte, error) {
+	var doc map[string]any
+	if err := json.Unmarshal(payload, &doc); err != nil || doc == nil {
+		return payload, nil
+	}
+	stripDonationHostFields(doc)
+	encoded, err := json.Marshal(doc)
+	if err != nil {
+		return payload, nil
+	}
+	return encoded, nil
+}
+
+func stripDonationHostFields(node any) {
+	switch value := node.(type) {
+	case map[string]any:
+		for key, child := range value {
+			if _, drop := donationStrippedCredentialFields[key]; drop {
+				delete(value, key)
+				continue
+			}
+			stripDonationHostFields(child)
+		}
+	case []any:
+		for _, child := range value {
+			stripDonationHostFields(child)
+		}
+	}
+}
+
 func (d *Donations) importAccount(ctx context.Context, providerID, region string, input DonationRequest) (accounts.Account, error) {
 	if d.accounts == nil {
 		return accounts.Account{}, operationError("donations_unavailable", "account service is unavailable")
@@ -292,13 +393,16 @@ func (d *Donations) importAccount(ctx context.Context, providerID, region string
 		name = providerID + " donation"
 	}
 
+	// The account is created disabled, in both branches. Nothing about a
+	// contributed credential has been checked against the provider, and enabled
+	// accounts carry other people's traffic, so enabling is an operator action.
 	if input.Format == donationQoderFormat {
 		return d.accounts.Import(ctx, AccountImportInput{
 			Format:    input.Format,
 			Name:      name,
 			Provider:  providerID,
 			Region:    region,
-			Enabled:   true,
+			Enabled:   false,
 			UserBlob:  strings.TrimSpace(input.UserBlob),
 			MachineID: strings.TrimSpace(input.MachineID),
 		}, nil)
@@ -308,14 +412,18 @@ func (d *Donations) importAccount(ctx context.Context, providerID, region string
 	if len(payload) == 0 {
 		return accounts.Account{}, operationError("invalid_credential", "credential is required")
 	}
+	sanitized, err := stripDonationCredentialHosts(payload)
+	if err != nil {
+		return accounts.Account{}, operationError("invalid_credential", err.Error())
+	}
 	return d.accounts.Import(ctx, AccountImportInput{
 		Format:     input.Format,
 		Name:       name,
 		Provider:   providerID,
 		Region:     region,
-		Enabled:    true,
-		Credential: payload,
-	}, payload)
+		Enabled:    false,
+		Credential: sanitized,
+	}, sanitized)
 }
 
 // donationProvider maps a contribution format to its provider family.
@@ -381,9 +489,9 @@ func (d *Donations) StartSession(ctx context.Context, input DonationStart) (Dona
 	if region == "" {
 		region = defaultDonationRegion(providerID)
 	}
-	usd := input.CreditUSD
-	if usd <= 0 {
-		usd = donationDefaultUSD
+	usd, err := normalizeDonationUSD(input.CreditUSD)
+	if err != nil {
+		return DonationSession{}, err
 	}
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
@@ -422,9 +530,10 @@ func (d *Donations) StartSession(ctx context.Context, input DonationStart) (Dona
 		CreatedAt:    d.now(),
 	}
 	d.mu.Lock()
-	d.sweepLocked()
+	expired := d.sweepLocked()
 	d.sessionStore()[record.ID] = record
 	d.mu.Unlock()
+	d.deleteSweptAccounts(ctx, expired)
 	return *record, nil
 }
 
@@ -433,28 +542,65 @@ func (d *Donations) StartSession(ctx context.Context, input DonationStart) (Dona
 // contributor exactly once.
 func (d *Donations) PollSession(ctx context.Context, sessionID string) (DonationSession, error) {
 	d.mu.Lock()
-	d.sweepLocked()
+	expired := d.sweepLocked()
 	record, ok := d.sessionStore()[sessionID]
+	// Snapshot under the lock, then act outside it. A settled or
+	// already-claimed round reports what it knows; only the poll that wins the
+	// claim below is allowed to credit.
+	var early DonationSession
+	claimed := false
+	if ok {
+		early = *record
+		claimed = !record.settling && !donationSettled(record)
+	}
 	d.mu.Unlock()
+	d.deleteSweptAccounts(ctx, expired)
+
 	if !ok {
 		return DonationSession{}, operationError("not_found", "unknown donation session")
 	}
-
-	// Already settled: report the stored outcome without crediting again.
-	if record.Status == "credited" || record.Status == "failed" {
-		return *record, nil
+	if !claimed {
+		return early, nil
 	}
 
 	done, message, err := d.accounts.PollLogin(ctx, record.AccountID)
 	if err != nil {
-		return *record, operationError("login_poll_failed", err.Error())
+		return d.sessionSnapshot(sessionID), operationError("login_poll_failed", err.Error())
+	}
+
+	// Claim the settle path under the lock. PollLogin runs outside it because it
+	// does I/O; the claim is what makes the credit happen exactly once when
+	// several polls observe the same completed login.
+	d.mu.Lock()
+	if record.settling || donationSettled(record) {
+		snapshot := *record
+		d.mu.Unlock()
+		return snapshot, nil
 	}
 	record.Message = message
 	if !done {
-		return *record, nil
+		snapshot := *record
+		d.mu.Unlock()
+		return snapshot, nil
 	}
+	record.settling = true
+	d.mu.Unlock()
 
-	return *d.settle(ctx, record), nil
+	d.settle(ctx, record)
+	return d.sessionSnapshot(sessionID), nil
+}
+
+// sessionSnapshot copies a session under the lock. Callers outside the critical
+// section must never read session fields directly: settle writes them, and a
+// torn struct copy is not something a caller can defend against.
+func (d *Donations) sessionSnapshot(sessionID string) DonationSession {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	record, ok := d.sessionStore()[sessionID]
+	if !ok {
+		return DonationSession{}
+	}
+	return *record
 }
 
 // CancelSession abandons a pending contribution and removes its placeholder
@@ -462,7 +608,7 @@ func (d *Donations) PollSession(ctx context.Context, sessionID string) (Donation
 func (d *Donations) CancelSession(ctx context.Context, sessionID string) error {
 	d.mu.Lock()
 	record, ok := d.sessionStore()[sessionID]
-	if ok && (record.Status == "credited" || record.Status == "failed") {
+	if ok && (donationSettled(record) || record.settling) {
 		d.mu.Unlock()
 		return operationError("invalid_request", "this contribution has already finished")
 	}
@@ -478,48 +624,98 @@ func (d *Donations) CancelSession(ctx context.Context, sessionID string) error {
 }
 
 // settle enables the authorized account and issues the reward once.
-func (d *Donations) settle(ctx context.Context, record *DonationSession) *DonationSession {
+//
+// It runs outside d.mu because both steps do I/O, and it never writes the
+// session directly: the outcome is committed in a single locked update. That is
+// what keeps a second poll from crediting again -- the caller claimed the round
+// by setting settling before calling this.
+func (d *Donations) settle(ctx context.Context, record *DonationSession) {
+	accountID := record.AccountID
+	userID := record.NewAPIUserID
+	quota := QuotaForUSD(record.CreditUSD)
+
 	// Enable+boot so the authorized credential is actually in the pool.
 	enabled := true
-	if _, err := d.accounts.Update(ctx, record.AccountID, accounts.UpdateAccount{Enabled: &enabled}); err != nil {
-		record.Status = "failed"
-		record.Message = "authorization succeeded but the account could not be enabled: " + err.Error()
-		return record
-	}
-
-	quota := QuotaForUSD(record.CreditUSD)
-	record.CreditedQuota = quota
-	if err := d.creditQuota(ctx, record.NewAPIUserID, quota); err != nil {
-		// The account is valid and stays in the pool; only the reward is
-		// outstanding, so an operator can credit it without re-authorizing.
-		record.Status = "failed"
-		record.CreditError = err.Error()
-		record.Message = "account authorized and added, but the credit failed"
-		return record
-	}
-	record.Status = "credited"
-	record.Credited = true
-	record.Message = "authorized and credited"
-	return record
-}
-
-// sweepLocked drops expired pending sessions and their placeholder accounts.
-// Must be called with d.mu held. It never touches a settled session, so a
-// completed reward is reported even after the TTL.
-func (d *Donations) sweepLocked() {
-	if d.sessions == nil {
+	if _, err := d.accounts.Update(ctx, accountID, accounts.UpdateAccount{Enabled: &enabled}); err != nil {
+		d.finishSettle(record.ID, "failed", 0, "",
+			"authorization succeeded but the account could not be enabled: "+err.Error())
 		return
 	}
-	cutoff := d.now().Add(-donationSessionTTL)
+
+	if err := d.creditQuota(ctx, userID, quota); err != nil {
+		// The account is valid and stays in the pool; only the reward is
+		// outstanding, so an operator can credit it without re-authorizing.
+		d.finishSettle(record.ID, "failed", quota, err.Error(),
+			"account authorized and added, but the credit failed")
+		return
+	}
+	d.finishSettle(record.ID, "credited", quota, "", "authorized and credited")
+}
+
+// finishSettle commits one settle outcome and releases the claim.
+func (d *Donations) finishSettle(sessionID, status string, quota int, creditErr, message string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	record, ok := d.sessionStore()[sessionID]
+	if !ok {
+		return
+	}
+	record.Status = status
+	record.CreditedQuota = quota
+	record.CreditError = creditErr
+	record.Message = message
+	record.Credited = status == "credited"
+	record.settling = false
+}
+
+// sweepLocked drops expired sessions and returns the placeholder accounts that
+// have to go with them. Must be called with d.mu held.
+//
+// Deletion is returned rather than performed here: it reaches the account store
+// (and the runtime), which must not happen while this lock is held, and doing it
+// on a detached goroutine makes the caller's view of the store race with the
+// sweep for no benefit -- the caller is already the only one who cares.
+//
+// Settled rounds expire too: there is one per completed contribution, and the
+// endpoint that creates them is unauthenticated, so leaving them in the map
+// forever is an unbounded memory growth path.
+func (d *Donations) sweepLocked() []string {
+	if d.sessions == nil {
+		return nil
+	}
+	now := d.now()
+	pendingCutoff := now.Add(-donationSessionTTL)
+	settledCutoff := now.Add(-donationSettledRetention)
+	var expired []string
 	for id, record := range d.sessions {
-		if record.Status != "pending" || record.CreatedAt.After(cutoff) {
+		// A claimed round is mid-flight; whoever claimed it owns the entry.
+		if record.settling {
+			continue
+		}
+		if donationSettled(record) {
+			if record.CreatedAt.After(settledCutoff) {
+				continue
+			}
+			// The account is the contribution being paid for, so it stays.
+			delete(d.sessions, id)
+			continue
+		}
+		if record.CreatedAt.After(pendingCutoff) {
 			continue
 		}
 		delete(d.sessions, id)
-		if d.accounts != nil {
-			go func(accountID string) {
-				_ = d.accounts.Delete(context.Background(), accountID)
-			}(record.AccountID)
-		}
+		expired = append(expired, record.AccountID)
+	}
+	return expired
+}
+
+// deleteSweptAccounts removes the placeholder accounts of expired rounds.
+// Failures are dropped: the round is gone and an unenabled placeholder is inert.
+func (d *Donations) deleteSweptAccounts(ctx context.Context, accountIDs []string) {
+	if d == nil || d.accounts == nil || len(accountIDs) == 0 {
+		return
+	}
+	for _, accountID := range accountIDs {
+		_ = d.accounts.Delete(ctx, accountID)
 	}
 }

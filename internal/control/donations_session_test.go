@@ -276,21 +276,16 @@ func TestSweepExpiredSessionRemovesAccount(t *testing.T) {
 	base := time.Now()
 	donations.clock = func() time.Time { return base.Add(donationSessionTTL + time.Minute) }
 	donations.mu.Lock()
-	donations.sweepLocked()
+	expired := donations.sweepLocked()
 	donations.mu.Unlock()
+	donations.deleteSweptAccounts(context.Background(), expired)
 
 	if _, ok := donations.sessions[session.ID]; ok {
 		t.Fatal("expired session was not swept")
 	}
-	// The sweep deletes asynchronously; the account must go away.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, ok := store.accounts[session.AccountID]; !ok {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	if _, ok := store.accounts[session.AccountID]; ok {
+		t.Fatal("expired session left its placeholder account behind")
 	}
-	t.Fatal("expired session left its placeholder account behind")
 }
 
 // A settled session survives the TTL so a finished reward is still reportable.
