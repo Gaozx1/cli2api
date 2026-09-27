@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/caigee-cmd/cli2api/internal/imgconvert"
 	"github.com/caigee-cmd/cli2api/internal/translate"
 )
 
@@ -18,6 +19,7 @@ func PrepareBody(src []byte) []byte {
 		return src
 	}
 	body["stream"] = true
+	normalizeImageParts(body)
 	normalizeToolChoice(body)
 	normalizeTools(body)
 	dropEmptyTools(body)
@@ -29,6 +31,37 @@ func PrepareBody(src []byte) []byte {
 		return src
 	}
 	return out
+}
+
+// normalizeImageParts re-encodes chat image attachments the upstream cannot
+// parse (WebP, for example) into PNG or JPEG.
+//
+// WorkBuddy answers an unparseable image with 11135 ("Image not recognized")
+// and tells the caller to convert it to JPG or PNG. That is a failure of the
+// image encoding, not of the request, and the gateway is the only party that
+// can fix it without the caller re-uploading -- so it is fixed here.
+func normalizeImageParts(body map[string]any) {
+	messages, ok := body["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, rawMessage := range messages {
+		message, ok := rawMessage.(map[string]any)
+		if !ok {
+			continue
+		}
+		parts, ok := message["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawPart := range parts {
+			part, ok := rawPart.(map[string]any)
+			if !ok {
+				continue
+			}
+			imgconvert.NormalizeImagePart(part)
+		}
+	}
 }
 
 func normalizeTools(body map[string]any) {

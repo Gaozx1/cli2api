@@ -1,0 +1,9 @@
+### English
+
+- Chat images the provider cannot parse are now converted automatically. WorkBuddy rejects an unreadable image with code 11135 ("Image not recognized") and asks the caller to re-upload it as JPG or PNG; the gateway used to forward the bytes untouched, so a request failed on the image encoding alone. A base64 image that is not already PNG or JPEG (WebP, GIF, and other decodable formats) is now re-encoded before sending — as PNG when it has transparency, otherwise as the smaller JPEG. Only the encoding changes; nothing is resized, and an image that is already PNG/JPEG, a remote link, or anything undecodable is passed through untouched, so this can never introduce a new failure. This does not disable the account: an unparseable image is a property of the request, not of the account.
+- Disabled accounts are now re-tested every 30 minutes and automatically turned back on when they work again. A ban that is lifted, a quota that refills, or a credential that is re-authorized previously left the account off until an operator noticed. Each disabled account is sent a minimal call on its cheapest model (chosen by the provider's own cost multiplier; two models per account at most, so a wide catalog cannot become a request storm), and a success re-enables it. Every test is recorded as a normal request attempt, so the content-review rule sees it and cannot re-disable an account on a stale failure streak.
+
+### 中文
+
+- 平台无法解析的图片现在会自动转换。WorkBuddy 对无法识别的图片返回 `11135`（"Image not recognized"）并要求改用 JPG 或 PNG 重新上传；网关此前原样转发字节，导致请求仅因图片编码而失败。现在非 PNG/JPEG 的 base64 图片（WebP、GIF 等可解码格式）会在发送前重新编码：带透明通道的转为 PNG，其余转为体积更小的 JPEG。只改变编码，不缩放；原本就是 PNG/JPEG 的、外链的、以及无法解码的一律原样透传，因此不会引入新的失败。这**不会禁用账号**：图片无法解析是请求本身的问题，不是账号的问题。
+- 被禁用的账号现在每 30 分钟自动重测一次，恢复正常就**自动重新启用**。封禁被解除、额度回充、凭据重新授权等情况此前都要等人工发现。每个被禁用账号会用**它最便宜的模型**发一次最小调用（按平台自己的费用倍率挑选；每账号最多 2 个模型，避免请求风暴），成功即重新启用。每次测试都记录为一次正常请求尝试，因此内容审查规则能看到它，不会因为过期的失败历史把刚恢复的账号再次禁用。

@@ -29,6 +29,7 @@ import (
 	"github.com/caigee-cmd/cli2api/internal/providers/qoder"
 	"github.com/caigee-cmd/cli2api/internal/providers/trae"
 	"github.com/caigee-cmd/cli2api/internal/providers/workbuddy"
+	"github.com/caigee-cmd/cli2api/internal/recovery"
 	accountruntime "github.com/caigee-cmd/cli2api/internal/runtime"
 	httpserver "github.com/caigee-cmd/cli2api/internal/server"
 	sqlstore "github.com/caigee-cmd/cli2api/internal/store"
@@ -165,6 +166,13 @@ func New(cfg config.Config) *App {
 	// calls were all content-review rejections.
 	if store != nil {
 		go contentreview.New(store, manager).RunSweepLoop(stopLogs)
+	}
+	// A disabled account is often disabled for a temporary reason (a lifted ban,
+	// a refilled quota), and nothing else would notice it recovered. Every 30
+	// minutes, test each disabled account on its cheapest model and re-enable it
+	// when it answers.
+	if store != nil && a.Control != nil && a.Control.Accounts != nil {
+		go recovery.New(store, a.Control.Accounts, providerReg).RunLoop(stopLogs)
 	}
 	// Auth copies and all executor copies read the same atomic live key.
 	// Cfg.ProxyAPIKey and Executor.WorkerKey remain bootstrap snapshots.

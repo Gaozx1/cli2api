@@ -5,6 +5,7 @@ go 1.25.6
 require github.com/joho/godotenv v1.5.1
 
 require (
+	golang.org/x/image v0.31.0
 	golang.org/x/net v0.56.0
 	google.golang.org/protobuf v1.36.10
 	modernc.org/sqlite v1.57.0
