@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/caigee-cmd/cli2api/internal/control"
-	"github.com/caigee-cmd/cli2api/internal/providers"
 )
 
 // donationMaxBody bounds a contribution payload. Credentials are small (a few
@@ -101,20 +100,65 @@ func (h *Handler) HandleDonationSession(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	sessionID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/donations/sessions/"), "/")
-	if sessionID == "" || strings.Contains(sessionID, "/") {
+	if sessionID == "" {
 		writeErr(w, http.StatusBadRequest, "invalid_request", "session id is required")
 		return
 	}
+	// A trailing /callback finishes the login; anything else is the session id.
+	parts := strings.Split(sessionID, "/")
+	if len(parts) > 2 || (len(parts) == 2 && parts[1] != "callback" && parts[1] != "restart") {
+		writeErr(w, http.StatusNotFound, "not_found", "unknown donation session action")
+		return
+	}
+	id := parts[0]
+	isCallback := len(parts) == 2 && parts[1] == "callback"
+	isRestart := len(parts) == 2 && parts[1] == "restart"
+
+	if isCallback {
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST only")
+			return
+		}
+		var input struct {
+			CallbackURL string `json:"callback_url"`
+		}
+		if err := decodeDonationBody(r, &input); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		session, err := donations.CompleteSession(r.Context(), id, input.CallbackURL)
+		if err != nil {
+			writeOperationError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, session)
+		return
+	}
+
+	if isRestart {
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST only")
+			return
+		}
+		session, err := donations.RestartSession(r.Context(), id)
+		if err != nil {
+			writeOperationError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, session)
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
-		session, err := donations.PollSession(r.Context(), sessionID)
+		session, err := donations.PollSession(r.Context(), id)
 		if err != nil {
 			writeOperationError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, session)
 	case http.MethodDelete:
-		if err := donations.CancelSession(r.Context(), sessionID); err != nil {
+		if err := donations.CancelSession(r.Context(), id); err != nil {
 			writeOperationError(w, err)
 			return
 		}
@@ -133,42 +177,19 @@ func decodeDonationBody(r *http.Request, target any) error {
 }
 
 // writeDonationInfo describes what can be contributed so the page can render
-// the accepted formats without hardcoding them.
+// the accepted formats without hardcoding them. Capabilities come from the
+// provider adapters, not from a provider list here.
 func (h *Handler) writeDonationInfo(w http.ResponseWriter) {
-	type donationFormat struct {
-		Format     string `json:"format"`
-		Provider   string `json:"provider"`
-		Label      string `json:"label"`
-		Region     string `json:"region"`
-		Credential string `json:"credential_kind"`
-		// WebAuth is true when the account can be authorized through the
-		// provider's own browser login, which is the preferred flow.
-		WebAuth     bool   `json:"web_auth"`
-		Description string `json:"description"`
-	}
-	formats := make([]donationFormat, 0, 2)
-	for _, descriptor := range providers.List() {
-		for _, format := range descriptor.CredentialFormats {
-			kind := "json"
-			if format == donationQoderFormat {
-				kind = "qoder_native"
-			}
-			formats = append(formats, donationFormat{
-				Format:      format,
-				Provider:    descriptor.ID,
-				Label:       descriptor.Label,
-				Region:      descriptor.DefaultRegion,
-				Credential:  kind,
-				WebAuth:     descriptor.Capabilities.BrowserLogin,
-				Description: descriptor.Label + " account contribution",
-			})
-		}
+	donations := h.donations()
+	if donations == nil {
+		writeErr(w, http.StatusServiceUnavailable, "donations_unavailable", "donations are not available")
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object":        "donation_info",
 		"default_usd":   1,
 		"quota_per_usd": control.QuotaForUSD(1),
-		"formats":       formats,
+		"formats":       donations.Formats(),
 	})
 }
 
@@ -178,7 +199,3 @@ func (h *Handler) donations() *control.Donations {
 	}
 	return h.Control.Donations
 }
-
-// donationQoderFormat mirrors control's constant; the console only needs it to
-// label the credential kind in the info payload.
-const donationQoderFormat = "qoder-native-v1"

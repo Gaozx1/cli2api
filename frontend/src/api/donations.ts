@@ -8,12 +8,17 @@ export type DonationFormat = {
   provider: string
   label: string
   region: string
+  // region_label is the provider's own name for the region ("Global", "CN").
+  region_label: string
   // "json" for a credential object, "qoder_native" for the base64 auth blob
   // plus machine id pair the Qoder CLI writes to its own home.
   credential_kind: string
   // web_auth is true when the account can be authorized through the provider's
   // own browser login, which is the preferred flow.
   web_auth: boolean
+  // callback_required is true when that login cannot complete through a loopback
+  // redirect, so the contributor must paste the callback URL back.
+  callback_required: boolean
   description: string
 }
 
@@ -38,6 +43,7 @@ export type DonationSession = {
   auth_url: string
   status: 'pending' | 'credited' | 'failed'
   message?: string
+  callback_required: boolean
   credited: boolean
   credited_quota?: number
   credit_error?: string
@@ -92,6 +98,24 @@ export function startDonation(input: DonationStart) {
 
 export function pollDonationSession(sessionId: string) {
   return api<DonationSession>(`/api/donations/sessions/${encodeURIComponent(sessionId)}`)
+}
+
+// completeDonationSession finishes a round whose provider redirects to a loopback
+// address the server cannot receive, using the URL copied from the browser.
+export function completeDonationSession(sessionId: string, callbackUrl: string) {
+  return api<DonationSession>(`/api/donations/sessions/${encodeURIComponent(sessionId)}/callback`, {
+    method: 'POST',
+    body: JSON.stringify({ callback_url: callbackUrl }),
+  })
+}
+
+// restartDonationSession re-opens the provider login when the round's handshake
+// was lost (for example across a server restart) instead of stranding it.
+export function restartDonationSession(sessionId: string) {
+  return api<DonationSession>(`/api/donations/sessions/${encodeURIComponent(sessionId)}/restart`, {
+    method: 'POST',
+    body: '{}',
+  })
 }
 
 export function cancelDonationSession(sessionId: string) {

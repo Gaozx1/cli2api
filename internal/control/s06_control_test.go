@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,15 +12,22 @@ import (
 	"github.com/caigee-cmd/cli2api/internal/providers"
 )
 
+// callLog records store/runtime calls. It is mutex-guarded because production
+// code now reaches it from concurrent request paths, and a bare append would be
+// a data race the moment two of those overlap.
 type callLog struct {
+	mu    sync.Mutex
 	names []string
 }
 
 func (l *callLog) add(name string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.names = append(l.names, name)
 }
 
 type fakeStore struct {
+	mu              sync.Mutex
 	log             *callLog
 	accounts        map[string]accounts.Account
 	payloads        map[string][]byte
@@ -57,13 +65,19 @@ func newFakeStore(log *callLog) *fakeStore {
 
 func (s *fakeStore) RecordPoolState(context.Context, accounts.PoolState) error { return nil }
 func (s *fakeStore) SaveCooldowns(context.Context, string, []accounts.CooldownRow) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return nil
 }
 func (s *fakeStore) LoadCooldowns(context.Context) ([]accounts.CooldownRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return nil, nil
 }
 func (s *fakeStore) Close() error { return nil }
 func (s *fakeStore) Backup(_ context.Context, directory string, keep int) (accounts.Backup, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.Backup")
 	if s.backupErr != nil {
 		return accounts.Backup{}, s.backupErr
@@ -76,6 +90,8 @@ func (s *fakeStore) Backup(_ context.Context, directory string, keep int) (accou
 	return s.backup, nil
 }
 func (s *fakeStore) Create(_ context.Context, input accounts.CreateAccount) (accounts.Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.Create")
 	if s.createErr != nil {
 		return accounts.Account{}, s.createErr
@@ -85,6 +101,8 @@ func (s *fakeStore) Create(_ context.Context, input accounts.CreateAccount) (acc
 	return account, nil
 }
 func (s *fakeStore) Get(_ context.Context, id string) (accounts.Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.Get")
 	if s.getFailOnce {
 		s.getFailOnce = false
@@ -101,6 +119,8 @@ func (s *fakeStore) Get(_ context.Context, id string) (accounts.Account, error) 
 }
 func (s *fakeStore) List(context.Context) ([]accounts.Account, error) { return nil, nil }
 func (s *fakeStore) Update(_ context.Context, id string, input accounts.UpdateAccount) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.Update")
 	if s.updateErr != nil {
 		return s.updateErr
@@ -116,6 +136,8 @@ func (s *fakeStore) Update(_ context.Context, id string, input accounts.UpdateAc
 	return nil
 }
 func (s *fakeStore) Delete(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.Delete")
 	if s.deleteErr != nil {
 		return s.deleteErr
@@ -125,15 +147,21 @@ func (s *fakeStore) Delete(_ context.Context, id string) error {
 	return nil
 }
 func (s *fakeStore) SaveCredential(_ context.Context, accountID, _ string, credential accounts.NativeCredential) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.SaveCredential")
 	s.native[accountID] = credential
 	return nil
 }
 func (s *fakeStore) LoadCredential(_ context.Context, accountID string) (accounts.NativeCredential, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.LoadCredential")
 	return s.native[accountID], nil
 }
 func (s *fakeStore) SaveCredentialPayload(_ context.Context, accountID, format string, payload []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.SaveCredentialPayload")
 	if s.payloadErr != nil {
 		return s.payloadErr
@@ -143,44 +171,64 @@ func (s *fakeStore) SaveCredentialPayload(_ context.Context, accountID, format s
 	return nil
 }
 func (s *fakeStore) LoadCredentialPayload(_ context.Context, accountID string) (string, []byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.LoadCredentialPayload")
 	return s.payloadFormats[accountID], s.payloads[accountID], nil
 }
 func (s *fakeStore) Observe(context.Context, string, string, string, string, string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return nil
 }
 func (s *fakeStore) SaveQuota(context.Context, string, *accounts.QuotaSnapshot) error { return nil }
 func (s *fakeStore) RecordCheckin(context.Context, string, string, string, time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return nil
 }
 func (s *fakeStore) ListCheckinRecords(_ context.Context, accountID string, _ int) ([]accounts.CheckinRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.ListCheckinRecords")
 	return s.checkins[accountID], nil
 }
 func (s *fakeStore) GetSecret(_ context.Context, name string) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.GetSecret")
 	value, ok := s.secrets[name]
 	return value, ok, nil
 }
 func (s *fakeStore) SetSecret(_ context.Context, name, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.SetSecret")
 	s.secrets[name] = value
 	return nil
 }
 func (s *fakeStore) SetSecretOrEmpty(_ context.Context, name, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.SetSecretOrEmpty")
 	s.secrets[name] = value
 	return nil
 }
 func (s *fakeStore) WorkBuddyCheckinTimeDefault(context.Context) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.WorkBuddyCheckinTimeDefault")
 	return "09:00"
 }
 func (s *fakeStore) GetModelContext(_ context.Context, modelID string) (int, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	value, ok := s.contexts[modelID]
 	return value, ok, nil
 }
 func (s *fakeStore) SetModelContext(_ context.Context, modelID string, contextLength int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.updateErr != nil {
 		return s.updateErr
 	}
@@ -192,15 +240,21 @@ func (s *fakeStore) SetModelContext(_ context.Context, modelID string, contextLe
 	return nil
 }
 func (s *fakeStore) ListModelContexts(context.Context) (map[string]int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.contexts, nil
 }
 func (s *fakeStore) GetProviderModelSetting(context.Context, string, string) (accounts.ProviderModelSetting, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.getErr != nil {
 		return accounts.ProviderModelSetting{}, s.getErr
 	}
 	return s.providerSetting, nil
 }
 func (s *fakeStore) SetProviderModelSetting(_ context.Context, _, _ string, setting accounts.ProviderModelSetting) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.updateErr != nil {
 		return s.updateErr
 	}
@@ -208,6 +262,8 @@ func (s *fakeStore) SetProviderModelSetting(_ context.Context, _, _ string, sett
 	return nil
 }
 func (s *fakeStore) InsertAPIKey(_ context.Context, key accounts.StoredAPIKey) (accounts.APIKey, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.InsertAPIKey")
 	if s.createErr != nil {
 		return accounts.APIKey{}, s.createErr
@@ -220,6 +276,8 @@ func (s *fakeStore) InsertAPIKey(_ context.Context, key accounts.StoredAPIKey) (
 	return out, nil
 }
 func (s *fakeStore) ListAPIKeys(context.Context) ([]accounts.APIKey, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.ListAPIKeys")
 	if s.listKeysErr != nil {
 		return nil, s.listKeysErr
@@ -234,6 +292,8 @@ func (s *fakeStore) ListAPIKeys(context.Context) ([]accounts.APIKey, error) {
 	return out, nil
 }
 func (s *fakeStore) GetAPIKey(_ context.Context, id string) (accounts.APIKey, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.GetAPIKey")
 	key, ok := s.keys[id]
 	if !ok {
@@ -242,9 +302,13 @@ func (s *fakeStore) GetAPIKey(_ context.Context, id string) (accounts.APIKey, er
 	return key, nil
 }
 func (s *fakeStore) LookupAPIKey(context.Context, string) (accounts.APIKey, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return accounts.APIKey{}, false, nil
 }
 func (s *fakeStore) SaveAPIKey(_ context.Context, key accounts.StoredAPIKey) (accounts.APIKey, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.SaveAPIKey")
 	if s.updateErr != nil {
 		return accounts.APIKey{}, s.updateErr
@@ -260,6 +324,8 @@ func (s *fakeStore) SaveAPIKey(_ context.Context, key accounts.StoredAPIKey) (ac
 	return current, nil
 }
 func (s *fakeStore) DeleteAPIKey(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.DeleteAPIKey")
 	if _, ok := s.keys[id]; !ok {
 		return accounts.ErrAPIKeyNotFound
@@ -268,6 +334,8 @@ func (s *fakeStore) DeleteAPIKey(_ context.Context, id string) error {
 	return nil
 }
 func (s *fakeStore) TouchAPIKey(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.log.add("store.TouchAPIKey")
 	_, ok := s.keys[id]
 	if !ok {

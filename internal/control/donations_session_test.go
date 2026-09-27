@@ -104,13 +104,15 @@ func TestStartSessionDoesNotCredit(t *testing.T) {
 	if hits != 0 {
 		t.Fatalf("credit must not fire before authorization, hits=%d", hits)
 	}
-	// The placeholder account must exist but stay disabled until authorized.
+	// The placeholder account must exist. It is created enabled, because a
+	// Qoder login needs the account's worker running; with no credential it
+	// never reports ready, so the pool never routes to it.
 	created := store.accounts[session.AccountID]
 	if created.ID == "" {
 		t.Fatal("placeholder account was not created")
 	}
-	if created.Enabled {
-		t.Fatal("placeholder account must not be enabled before authorization")
+	if !created.Enabled {
+		t.Fatal("placeholder account must be enabled so the provider worker can start")
 	}
 }
 
@@ -272,25 +274,47 @@ func TestSweepExpiredSessionRemovesAccount(t *testing.T) {
 		Format: "workbuddy-oauth-v1", NewAPIUserID: 7,
 	})
 
-	// Move the clock past the TTL, then trigger a sweep via a new round.
+	// Move the clock past the TTL, then sweep.
 	base := time.Now()
 	donations.clock = func() time.Time { return base.Add(donationSessionTTL + time.Minute) }
-	donations.mu.Lock()
-	donations.sweepLocked()
-	donations.mu.Unlock()
+	donations.SweepExpired(context.Background())
 
 	if _, ok := donations.sessions[session.ID]; ok {
 		t.Fatal("expired session was not swept")
 	}
-	// The sweep deletes asynchronously; the account must go away.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, ok := store.accounts[session.AccountID]; !ok {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	if _, ok := store.accounts[session.AccountID]; ok {
+		t.Fatal("expired session left its placeholder account behind")
 	}
-	t.Fatal("expired session left its placeholder account behind")
+}
+
+// A sweep must reclaim an abandoned placeholder even when the process was
+// restarted in between: sessions are persisted, so a restart does not strand
+// the account with nothing left to clean it up.
+func TestSweepSurvivesRestart(t *testing.T) {
+	login := &fakeLogin{authURL: "https://provider.example/auth"}
+	donations, store, _ := donationHarness(t, login, nil)
+	session, err := donations.StartSession(context.Background(), DonationStart{
+		Format: "workbuddy-oauth-v1", NewAPIUserID: 7,
+	})
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if _, ok := store.secrets[donationSessionsSecret]; !ok {
+		t.Fatal("session must be persisted so a restart can recover it")
+	}
+
+	// Simulate a restart: a fresh service over the same store, with an empty
+	// in-memory map and a clock past the TTL.
+	restarted := &Donations{
+		settings: NewSettings(store),
+		accounts: donations.accounts,
+		clock:    func() time.Time { return time.Now().Add(donationSessionTTL + time.Minute) },
+	}
+	restarted.SweepExpired(context.Background())
+
+	if _, ok := store.accounts[session.AccountID]; ok {
+		t.Fatal("a restart must not strand an abandoned placeholder account")
+	}
 }
 
 // A settled session survives the TTL so a finished reward is still reportable.
@@ -309,12 +333,132 @@ func TestSweepKeepsSettledSession(t *testing.T) {
 
 	base := time.Now()
 	donations.clock = func() time.Time { return base.Add(donationSessionTTL + time.Minute) }
-	donations.mu.Lock()
-	donations.sweepLocked()
-	donations.mu.Unlock()
+	donations.SweepExpired(context.Background())
 
 	if _, ok := donations.sessions[session.ID]; !ok {
 		t.Fatal("a settled session must not be swept")
+	}
+}
+
+// A provider whose login cannot complete through a loopback redirect must be
+// flagged for the callback paste, and polling must not settle it.
+func TestCallbackRequiredFormatIsFlaggedAndNotPolled(t *testing.T) {
+	var hits int32
+	site := creditSite(t, &hits)
+	login := &fakeLogin{authURL: "https://provider.example/auth"}
+	donations, _, _ := donationHarness(t, login, site)
+	// Register a completer so the adapter advertises the callback capability.
+	donations.accounts.Providers.Register(providers.Adapter{ID: "trae", Login: &fakeCompletingLogin{fakeLogin: login}})
+
+	formats := donations.Formats()
+	var trae *DonationFormatInfo
+	for i := range formats {
+		if formats[i].Provider == "trae" {
+			trae = &formats[i]
+		}
+	}
+	if trae == nil {
+		t.Fatal("trae format missing")
+	}
+	if !trae.CallbackRequired {
+		t.Fatal("a LoginCompleter provider must be flagged callback_required")
+	}
+
+	session, err := donations.StartSession(context.Background(), DonationStart{
+		Format: "trae-oauth-v1", NewAPIUserID: 7,
+	})
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if !session.CallbackRequired {
+		t.Fatal("session must carry callback_required")
+	}
+	// Even if the provider reports done, a callback-required round must not be
+	// settled by polling: the contributor has not submitted the callback yet.
+	login.finish("login complete")
+	polled, err := donations.PollSession(context.Background(), session.ID)
+	if err != nil {
+		t.Fatalf("PollSession: %v", err)
+	}
+	if polled.Credited || hits != 0 {
+		t.Fatalf("a callback-required round must not credit on poll: %+v", polled)
+	}
+}
+
+// fakeCompletingLogin adds the LoginCompleter capability to a fake login.
+type fakeCompletingLogin struct{ *fakeLogin }
+
+func (f *fakeCompletingLogin) CompleteLogin(context.Context, string, string) error { return nil }
+
+// Submitting a callback URL finishes the round and credits exactly once.
+func TestCompleteSessionCredits(t *testing.T) {
+	var hits int32
+	site := creditSite(t, &hits)
+	login := &fakeLogin{authURL: "https://provider.example/auth"}
+	donations, store, _ := donationHarness(t, login, site)
+	donations.accounts.Providers.Register(providers.Adapter{ID: "trae", Login: &fakeCompletingLogin{fakeLogin: login}})
+
+	session, err := donations.StartSession(context.Background(), DonationStart{
+		Format: "trae-oauth-v1", NewAPIUserID: 7,
+	})
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	settled, err := donations.CompleteSession(context.Background(), session.ID, "https://cb.example/?code=abc&state=st")
+	if err != nil {
+		t.Fatalf("CompleteSession: %v", err)
+	}
+	if settled.Status != "credited" || !settled.Credited {
+		t.Fatalf("settled = %+v, want credited", settled)
+	}
+	if hits != 1 {
+		t.Fatalf("credit hits = %d, want 1", hits)
+	}
+	if !store.accounts[session.AccountID].Enabled {
+		t.Fatal("authorized account must be enabled")
+	}
+	// Re-submitting must not credit twice.
+	again, err := donations.CompleteSession(context.Background(), session.ID, "https://cb.example/?code=abc&state=st")
+	if err != nil {
+		t.Fatalf("CompleteSession again: %v", err)
+	}
+	if again.Status != "credited" || hits != 1 {
+		t.Fatalf("repeat callback double-credited: status=%q hits=%d", again.Status, hits)
+	}
+}
+
+// A callback submission needs a URL.
+func TestCompleteSessionRequiresCallbackURL(t *testing.T) {
+	donations, _, _ := donationHarness(t, &fakeLogin{}, nil)
+	if _, err := donations.CompleteSession(context.Background(), "don_x", "  "); err == nil {
+		t.Fatal("an empty callback URL must be rejected")
+	}
+}
+
+// The advertised capabilities must come from the adapters, not a provider list.
+func TestFormatsReportAdapterCapabilities(t *testing.T) {
+	donations, _, _ := donationHarness(t, &fakeLogin{}, nil)
+	// Harness registers workbuddy with a plain login; add trae as a completer
+	// so the two capability shapes can be compared.
+	donations.accounts.Providers.Register(providers.Adapter{ID: "trae", Login: &fakeCompletingLogin{fakeLogin: &fakeLogin{}}})
+
+	formats := donations.Formats()
+	if len(formats) == 0 {
+		t.Fatal("no formats advertised")
+	}
+	byProvider := map[string]DonationFormatInfo{}
+	for _, f := range formats {
+		byProvider[f.Provider] = f
+	}
+	if !byProvider["workbuddy"].WebAuth || byProvider["workbuddy"].CallbackRequired {
+		t.Fatalf("workbuddy flags = %+v, want web_auth only", byProvider["workbuddy"])
+	}
+	if !byProvider["trae"].WebAuth || !byProvider["trae"].CallbackRequired {
+		t.Fatalf("trae flags = %+v, want web_auth + callback_required", byProvider["trae"])
+	}
+	// command has no login registered, so it must fall back to credentials.
+	if byProvider["command"].WebAuth {
+		t.Fatal("a provider with no login must not advertise web_auth")
 	}
 }
 

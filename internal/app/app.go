@@ -152,6 +152,11 @@ func New(cfg config.Config) *App {
 	if a.Control.Settings != nil {
 		a.Control.Settings.BindCatalog(a.Control.Catalog)
 	}
+	// Reclaim abandoned donation rounds even when no request ever arrives, so a
+	// contributor who walks away cannot leave a placeholder account behind.
+	if a.Control.Donations != nil {
+		go a.Control.Donations.RunSweepLoop(stopLogs)
+	}
 	// Auth copies and all executor copies read the same atomic live key.
 	// Cfg.ProxyAPIKey and Executor.WorkerKey remain bootstrap snapshots.
 	a.Executor.WorkerKeySource = a.Auth.ConsoleKey

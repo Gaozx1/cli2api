@@ -4,8 +4,10 @@ import { CheckCircle, HandHeart, Warning } from '@phosphor-icons/react'
 import { useI18n } from '@/hooks/useI18n'
 import {
   cancelDonationSession,
+  completeDonationSession,
   fetchDonationInfo,
   pollDonationSession,
+  restartDonationSession,
   startDonation,
   submitDonation,
   type DonationFormat,
@@ -24,6 +26,13 @@ type Phase = 'idle' | 'starting' | 'waiting' | 'done' | 'error'
 const QODER_NATIVE = 'qoder_native'
 const POLL_INTERVAL = 2500
 const POLL_ATTEMPTS = 120 // ~5 minutes, matching the pending-session TTL
+
+// formatKey identifies a selectable entry. One provider can be offered in more
+// than one region (Qoder global+cn, WorkBuddy cn+global), so the provider alone
+// is not unique -- the same "provider:region" shape the keys page uses.
+function formatKey(format: DonationFormat) {
+  return `${format.provider}:${format.region}`
+}
 
 function parseJSONCredential(raw: string): { value?: unknown; error?: string } {
   const text = raw.trim()
@@ -46,6 +55,7 @@ export function DonationsPage() {
   const [message, setMessage] = useState('')
   const [session, setSession] = useState<DonationSession | null>(null)
   const [authUrl, setAuthUrl] = useState('')
+  const [callbackUrl, setCallbackUrl] = useState('')
   // Fallback credential fields, for formats without a browser login.
   const [credential, setCredential] = useState('')
   const [userBlob, setUserBlob] = useState('')
@@ -60,7 +70,7 @@ export function DonationsPage() {
         if (!active) return
         setInfo(data)
         const first = data.formats?.[0]
-        if (first) setFormatID(first.format)
+        if (first) setFormatID(formatKey(first))
       })
       .catch((err: unknown) => {
         if (active) setInfoError(err instanceof Error ? err.message : String(err))
@@ -80,10 +90,11 @@ export function DonationsPage() {
   }, [])
 
   const selected: DonationFormat | undefined = useMemo(
-    () => info?.formats?.find((format) => format.format === formatID),
+    () => info?.formats?.find((format) => formatKey(format) === formatID),
     [info, formatID],
   )
   const webAuth = Boolean(selected?.web_auth)
+  const needsCallback = Boolean(session?.callback_required ?? selected?.callback_required)
   const rewardUSD = info?.default_usd ?? 1
   const rewardQuota = info?.quota_per_usd ?? 0
 
@@ -116,10 +127,67 @@ export function DonationsPage() {
         setMessage(current.credit_error ? t('donations.creditFailed', { error: current.credit_error }) : current.message || t('donations.failed'))
         return
       }
+      // A provider that redirects to a loopback address the server cannot
+      // receive never becomes done by polling: stop and wait for the pasted
+      // callback URL instead.
+      if (current.callback_required) {
+        setMessage(current.message || t('donations.waitingCallback'))
+        return
+      }
       setMessage(current.message || t('donations.waitingAuth'))
       timer.current = window.setTimeout(() => void poll(id, attempt + 1), POLL_INTERVAL)
     } catch (err: unknown) {
       if (cancelled.current) return
+      setPhase('error')
+      setMessage(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  // onRestart re-opens the provider login when the round's handshake was lost,
+  // instead of leaving the contributor stuck on a dead authorization page.
+  async function onRestart() {
+    if (!session) return
+    setPhase('starting')
+    setMessage('')
+    try {
+      const fresh = await restartDonationSession(session.session_id)
+      setSession(fresh)
+      setAuthUrl(fresh.auth_url)
+      if (fresh.auth_url) window.open(fresh.auth_url, '_blank', 'noopener,noreferrer')
+      setPhase('waiting')
+      setMessage(t('donations.waitingAuth'))
+      cancelled.current = false
+      void poll(fresh.session_id)
+    } catch (err: unknown) {
+      setPhase('error')
+      setMessage(err instanceof Error ? err.message : String(err))
+    }
+  }
+  // onCallback finishes a round with the URL the contributor copied out of
+  // their browser, for providers whose redirect never reaches this server.
+  async function onCallback() {
+    if (!session) return
+    if (!callbackUrl.trim()) {
+      setPhase('error')
+      setMessage(t('donations.callbackRequired'))
+      return
+    }
+    setPhase('starting')
+    try {
+      const settled = await completeDonationSession(session.session_id, callbackUrl.trim())
+      setSession(settled)
+      if (settled.credited) {
+        setPhase('done')
+        setMessage(t('donations.success', { usd: settled.credit_usd, quota: (settled.credited_quota || 0).toLocaleString() }))
+        setCallbackUrl('')
+      } else if (settled.status === 'failed') {
+        setPhase('error')
+        setMessage(settled.credit_error ? t('donations.creditFailed', { error: settled.credit_error }) : settled.message || t('donations.failed'))
+      } else {
+        setPhase('waiting')
+        setMessage(settled.message || t('donations.waitingAuth'))
+      }
+    } catch (err: unknown) {
       setPhase('error')
       setMessage(err instanceof Error ? err.message : String(err))
     }
@@ -271,7 +339,7 @@ export function DonationsPage() {
               <Select.Popover>
                 <ListBox>
                   {(info?.formats || []).map((format) => (
-                    <ListBox.Item key={format.format} id={format.format} textValue={format.label}>
+                    <ListBox.Item key={formatKey(format)} id={formatKey(format)} textValue={accountProviderLabel(format.provider, format.region, t)}>
                       <span className="flex items-center gap-2">
                         <ProviderMark provider={format.provider} />
                         <Label className="truncate">{accountProviderLabel(format.provider, format.region, t)}</Label>
@@ -312,7 +380,10 @@ export function DonationsPage() {
                 {phase === 'starting' ? t('donations.starting') : t('donations.authorize')}
               </Button>
               {phase === 'waiting' ? (
-                <Button variant="ghost" onPress={onCancel}>{t('donations.cancel')}</Button>
+                <>
+                  <Button variant="ghost" onPress={onCancel}>{t('donations.cancel')}</Button>
+                  <Button variant="ghost" onPress={onRestart}>{t('donations.restartAuth')}</Button>
+                </>
               ) : null}
               {authUrl ? (
                 <a
@@ -364,6 +435,22 @@ export function DonationsPage() {
               </Button>
             </>
           )}
+
+          {needsCallback && session && phase !== 'done' ? (
+            <div className="space-y-2">
+              <p className="text-xs leading-5 text-muted">{t('donations.callbackLead')}</p>
+              <TextArea
+                fullWidth
+                rows={3}
+                value={callbackUrl}
+                placeholder="https://.../?code=...&state=..."
+                onChange={(event) => setCallbackUrl(event.target.value)}
+              />
+              <Button variant="secondary" isDisabled={phase === 'starting'} onPress={onCallback}>
+                {t('donations.submitCallback')}
+              </Button>
+            </div>
+          ) : null}
 
           {phase === 'waiting' ? (
             <p className="text-xs leading-5 text-muted">{t('donations.waitingHint')}</p>

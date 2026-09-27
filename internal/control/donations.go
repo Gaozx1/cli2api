@@ -3,6 +3,8 @@ package control
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/accounts"
@@ -40,8 +41,71 @@ type Donations struct {
 	// and rebuilt on restart; a swept session leaves no reward behind.
 	mu       sync.Mutex
 	sessions map[string]*DonationSession
+	// loaded guards the one-time restore of pending sessions from the store.
+	loaded bool
 	// clock is injectable for tests.
 	clock func() time.Time
+}
+
+// DonationFormatInfo describes one contributable credential format. The console
+// renders these instead of hardcoding which provider supports what.
+type DonationFormatInfo struct {
+	Format   string `json:"format"`
+	Provider string `json:"provider"`
+	Label    string `json:"label"`
+	Region   string `json:"region"`
+	// RegionLabel is the provider's own name for the region ("Global", "CN").
+	RegionLabel    string `json:"region_label"`
+	CredentialKind string `json:"credential_kind"`
+	// WebAuth is true when the provider exposes a browser login.
+	WebAuth bool `json:"web_auth"`
+	// CallbackRequired is true when that login cannot complete through a
+	// loopback redirect, so the contributor must paste the callback URL back.
+	// This mirrors the console wizard's paste field, but reads the provider's
+	// LoginCompleter capability instead of naming providers.
+	CallbackRequired bool   `json:"callback_required"`
+	Description      string `json:"description"`
+}
+
+// Formats lists every contributable provider/region pair with its capabilities.
+//
+// One entry per region, not per provider: Qoder ships global+cn and WorkBuddy
+// ships cn+global, and a contributor must be able to pick the one their account
+// actually belongs to. Collapsing to DefaultRegion silently hides the others.
+func (d *Donations) Formats() []DonationFormatInfo {
+	formats := make([]DonationFormatInfo, 0, 8)
+	for _, descriptor := range providers.List() {
+		regions := descriptor.Regions
+		if len(regions) == 0 {
+			// No declared regions: still advertise one entry so the provider is
+			// selectable, using its default.
+			regions = []providers.RegionDescriptor{{ID: descriptor.DefaultRegion}}
+		}
+		for _, format := range descriptor.CredentialFormats {
+			kind := "json"
+			if format == donationQoderFormat {
+				kind = "qoder_native"
+			}
+			for _, region := range regions {
+				regionID := region.ID
+				if regionID == "" {
+					regionID = descriptor.DefaultRegion
+				}
+				formats = append(formats, DonationFormatInfo{
+					Format:           format,
+					Provider:         descriptor.ID,
+					Label:            descriptor.Label,
+					Region:           regionID,
+					RegionLabel:      region.Label,
+					CredentialKind:   kind,
+					WebAuth:          d.supportsWebAuth(descriptor.ID),
+					CallbackRequired: d.requiresCallback(descriptor.ID),
+					Description:      descriptor.Label + " account contribution",
+				})
+			}
+		}
+	}
+	return formats
 }
 
 // now is injectable so tests can drive session expiry without sleeping.
@@ -69,45 +133,80 @@ const (
 // before the pending account is swept. The provider login must finish inside it.
 const donationSessionTTL = 15 * time.Minute
 
-// donationDefaultUSD is the reward when the caller does not specify one.
+// donationDefaultUSD is the reward for one accepted contribution.
+//
+// It is server policy, not client input. The public endpoints still accept a
+// reward field for compatibility, but it is ignored: the reward is paid out of
+// the operator's own New API quota, so a caller never gets to price its own
+// payout. Changing the amount is a code change (later, a system setting), never
+// something a request can influence.
 const donationDefaultUSD = 1.0
 
-// donationSessionID returns an opaque id for one authorization round. It only
-// has to be unique within this process, since sessions are process-local.
-func donationSessionID() string {
-	return "don_" + strconv.FormatInt(time.Now().UnixNano(), 36) + strconv.FormatUint(nonce.Add(1), 36)
-}
+// donationSettledRetention bounds how long a finished session stays in memory so
+// its outcome can still be reported. Pending sessions use donationSessionTTL.
+// Without this, a settled session -- one per completed contribution -- would
+// live forever, since the sweep only ever looked at pending ones.
+const donationSettledRetention = 24 * time.Hour
 
-var nonce atomic.Uint64
+// donationSessionID returns an opaque id for one authorization round.
+//
+// It is drawn from crypto/rand rather than composed from the clock: a session id
+// is the only thing standing between an anonymous caller and somebody else's
+// in-flight round, because GET reports the authorization URL (OAuth state
+// included) and DELETE abandons the round.
+func donationSessionID() string {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		// crypto/rand does not fail in practice; degrade to a clock-derived id
+		// rather than handing back a constant.
+		return "don_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return "don_" + hex.EncodeToString(buf[:])
+}
 
 // DonationSession is one in-flight web authorization: the contributed account
 // exists and is being authorized in the browser, but the reward is not credited
 // until the provider login completes.
 type DonationSession struct {
-	ID            string    `json:"session_id"`
-	AccountID     string    `json:"account_id"`
-	Provider      string    `json:"provider"`
-	Region        string    `json:"region"`
-	Name          string    `json:"name"`
-	Format        string    `json:"format"`
-	NewAPIUserID  int       `json:"newapi_user_id"`
-	CreditUSD     float64   `json:"credit_usd"`
-	AuthURL       string    `json:"auth_url"`
-	Status        string    `json:"status"`
-	Message       string    `json:"message,omitempty"`
-	Credited      bool      `json:"credited"`
-	CreditedQuota int       `json:"credited_quota,omitempty"`
-	CreditError   string    `json:"credit_error,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID           string  `json:"session_id"`
+	AccountID    string  `json:"account_id"`
+	Provider     string  `json:"provider"`
+	Region       string  `json:"region"`
+	Name         string  `json:"name"`
+	Format       string  `json:"format"`
+	NewAPIUserID int     `json:"newapi_user_id"`
+	CreditUSD    float64 `json:"credit_usd"`
+	AuthURL      string  `json:"auth_url"`
+	Status       string  `json:"status"`
+	Message      string  `json:"message,omitempty"`
+	// CallbackRequired tells the page to offer the callback-URL paste box,
+	// because this provider cannot complete through a loopback redirect.
+	CallbackRequired bool      `json:"callback_required"`
+	Credited         bool      `json:"credited"`
+	CreditedQuota    int       `json:"credited_quota,omitempty"`
+	CreditError      string    `json:"credit_error,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+
+	// settling marks a round whose settle path has been claimed. It is not part
+	// of the wire contract; it exists so two concurrent polls cannot both pay
+	// out. Guarded by Donations.mu.
+	settling bool
+}
+
+// donationSettled reports whether a round has reached a terminal state.
+func donationSettled(record *DonationSession) bool {
+	return record.Status == "credited" || record.Status == "failed"
 }
 
 // DonationStart is the input for beginning a web-authorized contribution.
 type DonationStart struct {
-	Format       string  `json:"format"`
-	Name         string  `json:"name"`
-	Region       string  `json:"region"`
-	NewAPIUserID int     `json:"newapi_user_id"`
-	CreditUSD    float64 `json:"credit_usd"`
+	Format       string `json:"format"`
+	Name         string `json:"name"`
+	Region       string `json:"region"`
+	NewAPIUserID int    `json:"newapi_user_id"`
+	// CreditUSD is accepted for compatibility and ignored: the reward is server
+	// policy (donationDefaultUSD).
+	CreditUSD float64 `json:"credit_usd"`
 }
 
 // DonationCredential is the input for a pasted-credential contribution.
@@ -124,7 +223,8 @@ type DonationRequest struct {
 	Region string `json:"region"`
 	// NewAPIUserID is the contributor's numeric New API user id.
 	NewAPIUserID int `json:"newapi_user_id"`
-	// CreditUSD is the reward in USD. Zero means the server default.
+	// CreditUSD is accepted for compatibility and ignored; the reward is server
+	// policy (donationDefaultUSD). It used to be the caller's number to pick.
 	CreditUSD float64 `json:"credit_usd"`
 	// Credential carries the provider payload. For WorkBuddy this is the
 	// canonical flat credential; for qoder the raw user blob and machine id.
@@ -180,6 +280,14 @@ func QuotaForUSD(usd float64) int {
 		return 0
 	}
 	return int(usd*donationQuotaPerUSD + 0.5)
+}
+
+// donationRewardUSD is the reward for one accepted contribution.
+//
+// Server policy, never the caller's credit_usd. Both entry points read it from
+// here so the amount has a single home should it ever become a setting.
+func donationRewardUSD() float64 {
+	return donationDefaultUSD
 }
 
 // creditQuota adds quota to one New API user.
@@ -253,15 +361,15 @@ func (d *Donations) Submit(ctx context.Context, input DonationRequest) (Donation
 		region = defaultDonationRegion(providerID)
 	}
 
+	// The reward is priced here, not by the caller: credit_usd is accepted and
+	// ignored, so a rejected or absurd value cannot influence the payout.
+	usd := donationRewardUSD()
+
 	created, err := d.importAccount(ctx, providerID, region, input)
 	if err != nil {
 		return DonationResult{}, err
 	}
 
-	usd := input.CreditUSD
-	if usd <= 0 {
-		usd = 1
-	}
 	quota := QuotaForUSD(usd)
 
 	result := DonationResult{
@@ -283,6 +391,55 @@ func (d *Donations) Submit(ctx context.Context, input DonationRequest) (Donation
 	return result, nil
 }
 
+// donationStrippedCredentialFields are credential fields that select the host a
+// provider talks to. Providers accept them so an operator can point an account
+// at a non-default endpoint (command/client.go, devin/client.go,
+// trae/client.go all prefer the credential value over their constant).
+//
+// A contributed credential is untrusted input, and once the account is enabled
+// the pool routes other people's requests through it, so a contributor must not
+// be able to name that host.
+var donationStrippedCredentialFields = map[string]struct{}{
+	"base_url": {},
+	"baseUrl":  {},
+	"api_host": {},
+	"apiHost":  {},
+}
+
+// stripDonationCredentialHosts removes upstream-host overrides from a
+// contributed credential. Providers read them at the top level and, for Trae,
+// nested under "auth", so the walk is recursive. A payload that is not a JSON
+// object is returned untouched and left to the provider importer to reject.
+func stripDonationCredentialHosts(payload []byte) ([]byte, error) {
+	var doc map[string]any
+	if err := json.Unmarshal(payload, &doc); err != nil || doc == nil {
+		return payload, nil
+	}
+	stripDonationHostFields(doc)
+	encoded, err := json.Marshal(doc)
+	if err != nil {
+		return payload, nil
+	}
+	return encoded, nil
+}
+
+func stripDonationHostFields(node any) {
+	switch value := node.(type) {
+	case map[string]any:
+		for key, child := range value {
+			if _, drop := donationStrippedCredentialFields[key]; drop {
+				delete(value, key)
+				continue
+			}
+			stripDonationHostFields(child)
+		}
+	case []any:
+		for _, child := range value {
+			stripDonationHostFields(child)
+		}
+	}
+}
+
 func (d *Donations) importAccount(ctx context.Context, providerID, region string, input DonationRequest) (accounts.Account, error) {
 	if d.accounts == nil {
 		return accounts.Account{}, operationError("donations_unavailable", "account service is unavailable")
@@ -292,13 +449,16 @@ func (d *Donations) importAccount(ctx context.Context, providerID, region string
 		name = providerID + " donation"
 	}
 
+	// The account is created disabled, in both branches. Nothing about a
+	// contributed credential has been checked against the provider, and enabled
+	// accounts carry other people's traffic, so enabling is an operator action.
 	if input.Format == donationQoderFormat {
 		return d.accounts.Import(ctx, AccountImportInput{
 			Format:    input.Format,
 			Name:      name,
 			Provider:  providerID,
 			Region:    region,
-			Enabled:   true,
+			Enabled:   false,
 			UserBlob:  strings.TrimSpace(input.UserBlob),
 			MachineID: strings.TrimSpace(input.MachineID),
 		}, nil)
@@ -308,14 +468,18 @@ func (d *Donations) importAccount(ctx context.Context, providerID, region string
 	if len(payload) == 0 {
 		return accounts.Account{}, operationError("invalid_credential", "credential is required")
 	}
+	sanitized, err := stripDonationCredentialHosts(payload)
+	if err != nil {
+		return accounts.Account{}, operationError("invalid_credential", err.Error())
+	}
 	return d.accounts.Import(ctx, AccountImportInput{
 		Format:     input.Format,
 		Name:       name,
 		Provider:   providerID,
 		Region:     region,
-		Enabled:    true,
-		Credential: payload,
-	}, payload)
+		Enabled:    false,
+		Credential: sanitized,
+	}, sanitized)
 }
 
 // donationProvider maps a contribution format to its provider family.
@@ -337,17 +501,31 @@ func defaultDonationRegion(providerID string) string {
 	return "global"
 }
 
-// donationSupportsWebAuth reports whether a provider can authorize a
-// contribution through its own browser login. Qoder's child runtime exposes
-// device login through its worker, and every in-process provider that ships a
-// LoginSessionProvider can do the same; providers without one must fall back to
-// a pasted credential.
-func (d *Donations) donationSupportsWebAuth(providerID string) bool {
+// donationAdapter resolves a provider's adapter, or nil when it has none.
+func (d *Donations) donationAdapter(providerID string) (providers.Adapter, bool) {
 	if d == nil || d.accounts == nil || d.accounts.Providers == nil {
+		return providers.Adapter{}, false
+	}
+	return d.accounts.Providers.Get(providerID)
+}
+
+// supportsWebAuth reports whether a provider exposes a browser login.
+func (d *Donations) supportsWebAuth(providerID string) bool {
+	adapter, ok := d.donationAdapter(providerID)
+	return ok && adapter.Login != nil
+}
+
+// requiresCallback reports whether the provider's login must be finished by
+// pasting the callback URL. This is the LoginCompleter capability — the same
+// thing the console wizard offers for trae/devin/codex — read from the adapter
+// instead of a hardcoded provider list, so a new provider needs no UI change.
+func (d *Donations) requiresCallback(providerID string) bool {
+	adapter, ok := d.donationAdapter(providerID)
+	if !ok || adapter.Login == nil {
 		return false
 	}
-	adapter, ok := d.accounts.Providers.Get(providerID)
-	return ok && adapter.Login != nil
+	_, completable := adapter.Login.(providers.LoginCompleter)
+	return completable
 }
 
 func (d *Donations) sessionStore() map[string]*DonationSession {
@@ -355,6 +533,65 @@ func (d *Donations) sessionStore() map[string]*DonationSession {
 		d.sessions = map[string]*DonationSession{}
 	}
 	return d.sessions
+}
+
+// donationSessionsSecret holds every session as one JSON map. Sessions must
+// outlive a process restart: the placeholder account is created before the
+// contributor authorizes, so an in-memory-only record would leave that account
+// permanently orphaned — nothing left to poll it, and nothing left to sweep it.
+//
+// One key for the whole map (rather than one key per session) because the store
+// exposes no key enumeration, so the set must be recoverable without scanning.
+const donationSessionsSecret = "donation_sessions"
+
+// loadSessions restores persisted sessions once, then sweeps anything that
+// expired while the process was down.
+//
+// The whole load runs under the lock: it both reads the store and mutates the
+// map, and two concurrent callers must not interleave. The store read is a
+// single key, so holding the lock across it is bounded and simple.
+func (d *Donations) loadSessions(ctx context.Context) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.loaded {
+		return
+	}
+	d.loaded = true
+
+	if d.settings == nil {
+		return
+	}
+	raw, ok, err := d.settings.GetSecret(ctx, donationSessionsSecret)
+	if err != nil || !ok || strings.TrimSpace(raw) == "" {
+		return
+	}
+	var stored map[string]*DonationSession
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+		return
+	}
+	for id, record := range stored {
+		if record == nil || record.ID == "" {
+			continue
+		}
+		// Nothing is live yet on the very first load, so this is a plain
+		// restore; a record that was mid-settle when the process died cannot be
+		// resumed, so the claim is released and the round is re-driven.
+		record.settling = false
+		d.sessionStore()[id] = record
+	}
+}
+
+// flushSessionsLocked mirrors the session map to the store. Must be called with
+// d.mu held.
+func (d *Donations) flushSessionsLocked(ctx context.Context) {
+	if d.settings == nil {
+		return
+	}
+	encoded, err := json.Marshal(d.sessions)
+	if err != nil {
+		return
+	}
+	_ = d.settings.SetSecret(ctx, donationSessionsSecret, string(encoded))
 }
 
 // StartSession opens a web-authorization round for a contributed account.
@@ -374,26 +611,30 @@ func (d *Donations) StartSession(ctx context.Context, input DonationStart) (Dona
 	if d.accounts == nil {
 		return DonationSession{}, operationError("donations_unavailable", "account service is unavailable")
 	}
-	if !d.donationSupportsWebAuth(providerID) {
+	if !d.supportsWebAuth(providerID) {
 		return DonationSession{}, operationError("web_auth_unsupported", "this provider does not support web authorization")
 	}
 	region := strings.ToLower(strings.TrimSpace(input.Region))
 	if region == "" {
 		region = defaultDonationRegion(providerID)
 	}
-	usd := input.CreditUSD
-	if usd <= 0 {
-		usd = donationDefaultUSD
-	}
+	usd := donationRewardUSD()
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
 		name = providerID + " donation"
 	}
 
-	// The account starts disabled: it must not carry traffic before the
-	// contributor has actually authorized it.
+	// Created enabled, matching the console wizard: a Qoder login needs the
+	// account's child worker running, and the worker only starts for an enabled
+	// account. This is safe for the pool because the account has no usable
+	// credential until the provider authorizes it, and an account that is not
+	// ready is never routed to.
+	//
+	// The pasted-credential path is different and imports disabled: there the
+	// credential is untrusted input that has only passed a shape check, so
+	// enabling it is an operator decision.
 	created, err := d.accounts.Create(ctx, accounts.CreateAccount{
-		Name: name, Provider: providerID, Region: region, Enabled: false,
+		Name: name, Provider: providerID, Region: region, Enabled: true,
 	})
 	if err != nil {
 		return DonationSession{}, operationError("account_create_failed", err.Error())
@@ -408,65 +649,201 @@ func (d *Donations) StartSession(ctx context.Context, input DonationStart) (Dona
 	}
 
 	record := &DonationSession{
-		ID:           donationSessionID(),
-		AccountID:    created.ID,
-		Provider:     providerID,
-		Region:       region,
-		Name:         name,
-		Format:       input.Format,
-		NewAPIUserID: input.NewAPIUserID,
-		CreditUSD:    usd,
-		AuthURL:      session.AuthURL,
-		Status:       "pending",
-		Message:      "open the authorization URL to finish login",
-		CreatedAt:    d.now(),
+		ID:               donationSessionID(),
+		AccountID:        created.ID,
+		Provider:         providerID,
+		Region:           region,
+		Name:             name,
+		Format:           input.Format,
+		NewAPIUserID:     input.NewAPIUserID,
+		CreditUSD:        usd,
+		AuthURL:          session.AuthURL,
+		Status:           "pending",
+		CallbackRequired: d.requiresCallback(providerID),
+		Message:          "open the authorization URL to finish login",
+		CreatedAt:        d.now(),
 	}
 	d.mu.Lock()
-	d.sweepLocked()
+	expired := d.sweepLocked()
 	d.sessionStore()[record.ID] = record
+	d.flushSessionsLocked(ctx)
 	d.mu.Unlock()
+	d.deleteSweptAccounts(ctx, expired)
 	return *record, nil
+}
+
+// CompleteSession finishes a contribution whose provider redirects to a loopback
+// address this process cannot receive, using the callback URL the contributor
+// copied out of their browser. It is the donation equivalent of the console
+// wizard's callback paste, and is only valid for providers that implement
+// LoginCompleter.
+func (d *Donations) CompleteSession(ctx context.Context, sessionID, callbackURL string) (DonationSession, error) {
+	if strings.TrimSpace(callbackURL) == "" {
+		return DonationSession{}, operationError("invalid_request", "callback_url is required")
+	}
+	d.loadSessions(ctx)
+	if d.accounts == nil {
+		return DonationSession{}, operationError("donations_unavailable", "account service is unavailable")
+	}
+	// Claim the settle path first, exactly as the polling flow does, so a
+	// callback and a concurrent poll cannot both credit. Values are copied out
+	// under the lock and used off it; nothing is read through the shared record
+	// after the lock is released.
+	d.mu.Lock()
+	record, ok := d.sessionStore()[sessionID]
+	if !ok {
+		d.mu.Unlock()
+		return DonationSession{}, operationError("not_found", "unknown donation session")
+	}
+	if record.settling || donationSettled(record) {
+		snapshot := *record
+		d.mu.Unlock()
+		return snapshot, nil
+	}
+	record.settling = true
+	accountID := record.AccountID
+	userID := record.NewAPIUserID
+	quota := QuotaForUSD(record.CreditUSD)
+	d.flushSessionsLocked(ctx)
+	d.mu.Unlock()
+
+	if err := d.accounts.CompleteLogin(ctx, accountID, callbackURL); err != nil {
+		// Release the claim: the contributor can paste a corrected URL.
+		d.mu.Lock()
+		if current, found := d.sessionStore()[sessionID]; found {
+			current.settling = false
+			d.flushSessionsLocked(ctx)
+		}
+		d.mu.Unlock()
+		return d.sessionSnapshot(sessionID), operationError("login_callback_failed", err.Error())
+	}
+
+	d.settle(ctx, sessionID, accountID, userID, quota)
+	return d.sessionSnapshot(sessionID), nil
 }
 
 // PollSession reports progress on a web-authorized contribution. Once the
 // provider login reports done it enables the account and credits the
 // contributor exactly once.
 func (d *Donations) PollSession(ctx context.Context, sessionID string) (DonationSession, error) {
+	d.loadSessions(ctx)
 	d.mu.Lock()
-	d.sweepLocked()
+	expired := d.sweepLocked()
 	record, ok := d.sessionStore()[sessionID]
+	// Snapshot under the lock, then act outside it. A settled or
+	// already-claimed round reports what it knows; only the poll that wins the
+	// claim below is allowed to credit.
+	var early DonationSession
+	claimed := false
+	accountID := ""
+	callbackRequired := false
+	if ok {
+		early = *record
+		claimed = !record.settling && !donationSettled(record)
+		// Copy the fields needed off-lock: reading through the shared pointer
+		// after releasing the lock would race with settle's writes.
+		accountID = record.AccountID
+		callbackRequired = record.CallbackRequired
+	}
 	d.mu.Unlock()
+	d.deleteSweptAccounts(ctx, expired)
+
 	if !ok {
 		return DonationSession{}, operationError("not_found", "unknown donation session")
 	}
-
-	// Already settled: report the stored outcome without crediting again.
-	if record.Status == "credited" || record.Status == "failed" {
-		return *record, nil
+	if !claimed {
+		return early, nil
 	}
 
-	done, message, err := d.accounts.PollLogin(ctx, record.AccountID)
+	// A provider that needs a pasted callback cannot complete by polling; the
+	// page must submit the callback URL instead.
+	if callbackRequired {
+		return early, nil
+	}
+
+	done, message, err := d.accounts.PollLogin(ctx, accountID)
 	if err != nil {
-		return *record, operationError("login_poll_failed", err.Error())
-	}
-	record.Message = message
-	if !done {
-		return *record, nil
+		// The provider forgot this handshake — typically because the process
+		// restarted. Say so plainly so the page can offer a restart instead of
+		// showing a provider-internal error. Nothing is credited either way.
+		if donationLostLoginState(err) {
+			d.mu.Lock()
+			if current, found := d.sessionStore()[sessionID]; found && !donationSettled(current) {
+				current.Message = "the authorization session expired; start it again"
+				d.flushSessionsLocked(ctx)
+			}
+			snapshot := d.sessionSnapshotLocked(sessionID)
+			d.mu.Unlock()
+			return snapshot, nil
+		}
+		return d.sessionSnapshot(sessionID), operationError("login_poll_failed", err.Error())
 	}
 
-	return *d.settle(ctx, record), nil
+	// Claim the settle path under the lock. PollLogin runs outside it because it
+	// does I/O; the claim is what makes the credit happen exactly once when
+	// several polls observe the same completed login.
+	d.mu.Lock()
+	current, found := d.sessionStore()[sessionID]
+	if !found {
+		d.mu.Unlock()
+		return DonationSession{}, operationError("not_found", "unknown donation session")
+	}
+	if current.settling || donationSettled(current) {
+		snapshot := *current
+		d.mu.Unlock()
+		return snapshot, nil
+	}
+	current.Message = message
+	if !done {
+		snapshot := *current
+		d.mu.Unlock()
+		return snapshot, nil
+	}
+	current.settling = true
+	accountID = current.AccountID
+	userID := current.NewAPIUserID
+	quota := QuotaForUSD(current.CreditUSD)
+	sessionIDCopy := current.ID
+	d.mu.Unlock()
+
+	d.settle(ctx, sessionIDCopy, accountID, userID, quota)
+	return d.sessionSnapshot(sessionID), nil
+}
+
+// sessionSnapshotLocked copies a session while d.mu is already held.
+func (d *Donations) sessionSnapshotLocked(sessionID string) DonationSession {
+	record, ok := d.sessionStore()[sessionID]
+	if !ok {
+		return DonationSession{}
+	}
+	return *record
+}
+
+// sessionSnapshot copies a session under the lock. Callers outside the critical
+// section must never read session fields directly: settle writes them, and a
+// torn struct copy is not something a caller can defend against.
+func (d *Donations) sessionSnapshot(sessionID string) DonationSession {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	record, ok := d.sessionStore()[sessionID]
+	if !ok {
+		return DonationSession{}
+	}
+	return *record
 }
 
 // CancelSession abandons a pending contribution and removes its placeholder
 // account. A settled session is left alone so a finished reward is not lost.
 func (d *Donations) CancelSession(ctx context.Context, sessionID string) error {
+	d.loadSessions(ctx)
 	d.mu.Lock()
 	record, ok := d.sessionStore()[sessionID]
-	if ok && (record.Status == "credited" || record.Status == "failed") {
+	if ok && (donationSettled(record) || record.settling) {
 		d.mu.Unlock()
 		return operationError("invalid_request", "this contribution has already finished")
 	}
 	delete(d.sessionStore(), sessionID)
+	d.flushSessionsLocked(ctx)
 	d.mu.Unlock()
 	if !ok {
 		return operationError("not_found", "unknown donation session")
@@ -478,48 +855,187 @@ func (d *Donations) CancelSession(ctx context.Context, sessionID string) error {
 }
 
 // settle enables the authorized account and issues the reward once.
-func (d *Donations) settle(ctx context.Context, record *DonationSession) *DonationSession {
+//
+// It runs outside d.mu because both steps do I/O, so it takes plain values
+// rather than the session pointer: reading fields off a shared record here would
+// race with another poll. The outcome is committed in a single locked update,
+// which is what keeps a second poll from crediting again -- the caller claimed
+// the round by setting settling before calling this.
+func (d *Donations) settle(ctx context.Context, sessionID, accountID string, userID, quota int) {
 	// Enable+boot so the authorized credential is actually in the pool.
 	enabled := true
-	if _, err := d.accounts.Update(ctx, record.AccountID, accounts.UpdateAccount{Enabled: &enabled}); err != nil {
-		record.Status = "failed"
-		record.Message = "authorization succeeded but the account could not be enabled: " + err.Error()
-		return record
-	}
-
-	quota := QuotaForUSD(record.CreditUSD)
-	record.CreditedQuota = quota
-	if err := d.creditQuota(ctx, record.NewAPIUserID, quota); err != nil {
-		// The account is valid and stays in the pool; only the reward is
-		// outstanding, so an operator can credit it without re-authorizing.
-		record.Status = "failed"
-		record.CreditError = err.Error()
-		record.Message = "account authorized and added, but the credit failed"
-		return record
-	}
-	record.Status = "credited"
-	record.Credited = true
-	record.Message = "authorized and credited"
-	return record
-}
-
-// sweepLocked drops expired pending sessions and their placeholder accounts.
-// Must be called with d.mu held. It never touches a settled session, so a
-// completed reward is reported even after the TTL.
-func (d *Donations) sweepLocked() {
-	if d.sessions == nil {
+	if _, err := d.accounts.Update(ctx, accountID, accounts.UpdateAccount{Enabled: &enabled}); err != nil {
+		d.finishSettle(ctx, sessionID, "failed", 0, "",
+			"authorization succeeded but the account could not be enabled: "+err.Error())
 		return
 	}
-	cutoff := d.now().Add(-donationSessionTTL)
+
+	if err := d.creditQuota(ctx, userID, quota); err != nil {
+		// The account is valid and stays in the pool; only the reward is
+		// outstanding, so an operator can credit it without re-authorizing.
+		d.finishSettle(ctx, sessionID, "failed", quota, err.Error(),
+			"account authorized and added, but the credit failed")
+		return
+	}
+	d.finishSettle(ctx, sessionID, "credited", quota, "", "authorized and credited")
+}
+
+// finishSettle commits one settle outcome and releases the claim. The outcome is
+// mirrored to the store so a finished reward stays reportable across a restart.
+func (d *Donations) finishSettle(ctx context.Context, sessionID, status string, quota int, creditErr, message string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	record, ok := d.sessionStore()[sessionID]
+	if !ok {
+		return
+	}
+	record.Status = status
+	record.CreditedQuota = quota
+	record.CreditError = creditErr
+	record.Message = message
+	record.Credited = status == "credited"
+	record.settling = false
+	d.flushSessionsLocked(ctx)
+}
+
+// sweepLocked drops expired sessions and returns the placeholder accounts that
+// have to go with them. Must be called with d.mu held.
+//
+// Deletion is returned rather than performed here: it reaches the account store
+// (and the runtime), which must not happen while this lock is held, and doing it
+// on a detached goroutine makes the caller's view of the store race with the
+// sweep for no benefit -- the caller is already the only one who cares.
+//
+// Settled rounds expire too: there is one per completed contribution, and the
+// endpoint that creates them is unauthenticated, so leaving them in the map
+// forever is an unbounded memory growth path.
+func (d *Donations) sweepLocked() []string {
+	if d.sessions == nil {
+		return nil
+	}
+	now := d.now()
+	pendingCutoff := now.Add(-donationSessionTTL)
+	settledCutoff := now.Add(-donationSettledRetention)
+	var expired []string
 	for id, record := range d.sessions {
-		if record.Status != "pending" || record.CreatedAt.After(cutoff) {
+		// A claimed round is mid-flight; whoever claimed it owns the entry.
+		if record.settling {
+			continue
+		}
+		if donationSettled(record) {
+			if record.CreatedAt.After(settledCutoff) {
+				continue
+			}
+			// The account is the contribution being paid for, so it stays.
+			delete(d.sessions, id)
+			continue
+		}
+		if record.CreatedAt.After(pendingCutoff) {
 			continue
 		}
 		delete(d.sessions, id)
-		if d.accounts != nil {
-			go func(accountID string) {
-				_ = d.accounts.Delete(context.Background(), accountID)
-			}(record.AccountID)
+		expired = append(expired, record.AccountID)
+	}
+	// Mirror the removal so a restart cannot resurrect a swept round and strand
+	// its placeholder account all over again.
+	if len(expired) > 0 {
+		d.flushSessionsLocked(context.Background())
+	}
+	return expired
+}
+
+// deleteSweptAccounts removes the placeholder accounts of expired rounds.
+// Failures are dropped: the round is gone and an unenabled placeholder is inert.
+func (d *Donations) deleteSweptAccounts(ctx context.Context, accountIDs []string) {
+	if d == nil || d.accounts == nil || len(accountIDs) == 0 {
+		return
+	}
+	for _, accountID := range accountIDs {
+		_ = d.accounts.Delete(ctx, accountID)
+	}
+}
+
+// SweepExpired reclaims expired rounds. It is exposed so a background ticker can
+// drive it: reclamation must not depend on a later request arriving, or an
+// abandoned round leaves its placeholder account behind forever.
+func (d *Donations) SweepExpired(ctx context.Context) {
+	d.loadSessions(ctx)
+	d.mu.Lock()
+	expired := d.sweepLocked()
+	d.mu.Unlock()
+	d.deleteSweptAccounts(ctx, expired)
+}
+
+// donationSweepInterval is how often abandoned rounds are reclaimed. The TTL is
+// 15 minutes, so a coarse tick is enough.
+const donationSweepInterval = time.Minute
+
+// RunSweepLoop reclaims expired rounds until stop closes.
+func (d *Donations) RunSweepLoop(stop <-chan struct{}) {
+	ticker := time.NewTicker(donationSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			d.SweepExpired(context.Background())
 		}
 	}
+}
+
+// RestartSession re-opens the provider login for a pending round.
+//
+// The provider's login handshake lives in the provider's memory, so a process
+// restart (or an expired auth URL) leaves a pending round that can never finish
+// by polling. Rather than strand the account or force a duplicate, this re-runs
+// StartLogin on the same account and returns a fresh authorization URL -- the
+// same thing the console wizard does when it starts the browser login again.
+func (d *Donations) RestartSession(ctx context.Context, sessionID string) (DonationSession, error) {
+	d.loadSessions(ctx)
+	d.mu.Lock()
+	record, ok := d.sessionStore()[sessionID]
+	if ok {
+		// A claimed round is mid-flight; restarting it would fight the claim.
+		if record.settling || donationSettled(record) {
+			snapshot := *record
+			d.mu.Unlock()
+			return snapshot, nil
+		}
+		record.Message = "authorization restarted"
+	}
+	d.mu.Unlock()
+	if !ok {
+		return DonationSession{}, operationError("not_found", "unknown donation session")
+	}
+	if d.accounts == nil {
+		return DonationSession{}, operationError("donations_unavailable", "account service is unavailable")
+	}
+
+	session, err := d.accounts.StartLogin(ctx, record.AccountID)
+	if err != nil {
+		return d.sessionSnapshot(sessionID), operationError("login_start_failed", err.Error())
+	}
+	d.mu.Lock()
+	if current, found := d.sessionStore()[sessionID]; found {
+		current.AuthURL = session.AuthURL
+		current.Message = "authorization restarted"
+	}
+	d.flushSessionsLocked(ctx)
+	snapshot := *d.sessionStore()[sessionID]
+	d.mu.Unlock()
+	return snapshot, nil
+}
+
+// donationLostLoginState reports whether a poll error means the provider no
+// longer knows about this login. That happens when the process restarted, or
+// when the provider dropped the handshake; either way the round needs a restart.
+func donationLostLoginState(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "login not started") ||
+		strings.Contains(message, "unknown account") ||
+		strings.Contains(message, "not running")
 }
