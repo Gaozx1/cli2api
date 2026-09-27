@@ -11,6 +11,9 @@ export type DonationFormat = {
   // "json" for a credential object, "qoder_native" for the base64 auth blob
   // plus machine id pair the Qoder CLI writes to its own home.
   credential_kind: string
+  // web_auth is true when the account can be authorized through the provider's
+  // own browser login, which is the preferred flow.
+  web_auth: boolean
   description: string
 }
 
@@ -19,6 +22,33 @@ export type DonationInfo = {
   default_usd: number
   quota_per_usd: number
   formats: DonationFormat[]
+}
+
+// DonationSession is one in-flight web authorization. The reward is credited
+// only once status becomes "credited".
+export type DonationSession = {
+  session_id: string
+  account_id: string
+  provider: string
+  region: string
+  name: string
+  format: string
+  newapi_user_id: number
+  credit_usd: number
+  auth_url: string
+  status: 'pending' | 'credited' | 'failed'
+  message?: string
+  credited: boolean
+  credited_quota?: number
+  credit_error?: string
+}
+
+export type DonationStart = {
+  format: string
+  name?: string
+  region?: string
+  newapi_user_id: number
+  credit_usd?: number
 }
 
 export type DonationResult = {
@@ -52,8 +82,26 @@ export function fetchDonationInfo() {
   return api<DonationInfo>('/api/donations')
 }
 
+// startDonation begins a web-authorization round and returns the URL to open.
+export function startDonation(input: DonationStart) {
+  return api<DonationSession>('/api/donations', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function pollDonationSession(sessionId: string) {
+  return api<DonationSession>(`/api/donations/sessions/${encodeURIComponent(sessionId)}`)
+}
+
+export function cancelDonationSession(sessionId: string) {
+  return api<void>(`/api/donations/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+}
+
+// submitDonation is the legacy pasted-credential path, kept for providers that
+// do not expose a browser login.
 export function submitDonation(input: DonationSubmit) {
-  return api<DonationResult>('/api/donations', {
+  return api<DonationResult>('/api/donations/credential', {
     method: 'POST',
     body: JSON.stringify(input),
   })
