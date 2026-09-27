@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { Button, Card, Chip, Input, Label, ListBox, Select, TextArea } from '@heroui/react'
 import { CheckCircle, HandHeart, Lock, Warning } from '@phosphor-icons/react'
 import { useI18n } from '@/hooks/useI18n'
@@ -39,8 +39,16 @@ function formatKey(format: DonationFormat) {
   return `${format.provider}:${format.region}`
 }
 
-function parseJSONCredential(raw: string): { value?: unknown; error?: string } {
-  const text = raw.trim()
+// uidFromQuery extracts a positive integer uid from a query string
+// ("?uid=123&x=1" -> "123"). Anything absent, non-numeric or non-positive
+// yields an empty string, which means "no link pinned a recipient".
+function uidFromQuery(search: string): string {
+  const raw = new URLSearchParams(search).get('uid') ?? ''
+  const value = Number.parseInt(raw.trim(), 10)
+  return Number.isFinite(value) && value > 0 ? String(value) : ''
+}
+
+function parseJSONCredential(raw: string): { value?: unknown; error?: string } {  const text = raw.trim()
   if (!text) return { error: 'empty' }
   try {
     return { value: JSON.parse(text) }
@@ -52,16 +60,11 @@ function parseJSONCredential(raw: string): { value?: unknown; error?: string } {
 export function DonationsPage() {
   const { t } = useI18n()
   const navigate = useNavigate()
-  // A contribution link can carry the contributor's New API user id. Read it
-  // ONCE at mount: the query string is stripped from the address bar below, so
-  // anything derived from location.search would be recomputed to empty a moment
-  // later (which is how a "lock" built on location.search silently unlocks
-  // itself). A plain "uid-at-mount" state cannot drift like that.
-  const [presetUID] = useState(() => {
-    const raw = new URLSearchParams(window.location.search).get('uid') ?? ''
-    const value = Number.parseInt(raw.trim(), 10)
-    return Number.isFinite(value) && value > 0 ? String(value) : ''
-  })
+  const location = useLocation()
+  // A contribution link can carry the contributor's New API user id. It is held
+  // in state rather than derived from the query string, because the query string
+  // is cleared below and the lock has to outlive it.
+  const [presetUID, setPresetUID] = useState(() => uidFromQuery(window.location.search))
   const [info, setInfo] = useState<DonationInfo | null>(null)
   const [infoError, setInfoError] = useState('')
   const [formatID, setFormatID] = useState('')
@@ -82,14 +85,22 @@ export function DonationsPage() {
   const timer = useRef<number | null>(null)
   const cancelled = useRef(false)
 
-  // Strip the query string from the address bar right away so the link reads as
-  // a plain /donations afterwards. presetUID is already captured above, so this
-  // cannot affect it.
+  // Handle the uid query and clear it from the address bar.
+  //
+  // Keyed on location.search, NOT on mount: when the app is already showing
+  // /donations and only the query changes (an in-app link, or a pasted URL the
+  // router handles client-side), React Router keeps the same component mounted
+  // and this effect would never re-run on a [] dependency -- the tail stayed in
+  // the address bar and the field never locked. Keying on location.search also
+  // means clearing the query re-runs it once more with an empty search, which is
+  // harmless: the uid already lives in state.
   useEffect(() => {
-    if (window.location.search) {
+    if (location.search) {
+      const next = uidFromQuery(location.search)
+      if (next) setPresetUID(next)
       navigate('/donations', { replace: true })
     }
-  }, [navigate])
+  }, [location.search, navigate])
 
   useEffect(() => {
     let active = true
