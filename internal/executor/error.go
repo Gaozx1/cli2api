@@ -117,7 +117,16 @@ func ClassifyError(err error) Classified {
 		case providerErr.Code == "4011" && providerErr.RetryAfter <= 0:
 			classified.Cooldown = 5 * time.Minute
 		case providerErr.RetryAfter > 0:
-			classified.Cooldown = providerErr.RetryAfter
+			// A provider can report the window's absolute RESET time as its retry
+			// hint -- WorkBuddy parses "will reset at <timestamp>" out of the
+			// usage-limit message. That instant can be hours away, and taking it
+			// at face value parked accounts for 15 hours after a single failure
+			// (backoff level 0) while they were demonstrably still serving, and it
+			// bypassed BOTH the retry-after cap and the backoff ceiling: those are
+			// applied to the HTTP header hint, not to a provider's own RetryAfter.
+			// Cap it like any other hint, so a long or stale reset only costs one
+			// cap-length wait before the account is retried and re-judged.
+			classified.Cooldown = clampRetryAfter(providerErr.RetryAfter)
 			if classified.Cooldown < 30*time.Second {
 				classified.Cooldown = 30 * time.Second
 			}
