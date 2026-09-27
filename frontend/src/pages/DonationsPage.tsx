@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 import { Button, Card, Chip, Input, Label, ListBox, Select, TextArea } from '@heroui/react'
-import { CheckCircle, HandHeart, Warning } from '@phosphor-icons/react'
+import { CheckCircle, HandHeart, Lock, Warning } from '@phosphor-icons/react'
 import { useI18n } from '@/hooks/useI18n'
 import {
   cancelDonationSession,
@@ -51,11 +51,23 @@ function parseJSONCredential(raw: string): { value?: unknown; error?: string } {
 
 export function DonationsPage() {
   const { t } = useI18n()
-  const location = useLocation()
   const navigate = useNavigate()
+  // A contribution link can carry the contributor's New API user id. Read it
+  // ONCE at mount: the query string is stripped from the address bar below, so
+  // anything derived from location.search would be recomputed to empty a moment
+  // later (which is how a "lock" built on location.search silently unlocks
+  // itself). A plain "uid-at-mount" state cannot drift like that.
+  const [presetUID] = useState(() => {
+    const raw = new URLSearchParams(window.location.search).get('uid') ?? ''
+    const value = Number.parseInt(raw.trim(), 10)
+    return Number.isFinite(value) && value > 0 ? String(value) : ''
+  })
   const [info, setInfo] = useState<DonationInfo | null>(null)
   const [infoError, setInfoError] = useState('')
   const [formatID, setFormatID] = useState('')
+  // The effective recipient: the preset id when a link pinned one, otherwise
+  // whatever was typed. Read-only in the former case -- there is no input for
+  // the contributor to change.
   const [userID, setUserID] = useState('')
   const [accountName, setAccountName] = useState('')
   const [phase, setPhase] = useState<Phase>('idle')
@@ -70,25 +82,14 @@ export function DonationsPage() {
   const timer = useRef<number | null>(null)
   const cancelled = useRef(false)
 
-  // A contribution link can carry the contributor's New API user id, so an
-  // operator can hand out http://host/donations?uid=123 and the field arrives
-  // filled in. The value is only a PREFILL: the field stays editable, because
-  // it is the contributor's own payout target and they may need to correct it.
-  // The query string is stripped from the address bar right away so the link
-  // reads as a plain /donations afterwards.
-  const presetUID = useMemo(() => {
-    const raw = new URLSearchParams(location.search).get('uid') ?? ''
-    const value = Number.parseInt(raw.trim(), 10)
-    return Number.isFinite(value) && value > 0 ? String(value) : ''
-  }, [location.search])
-
+  // Strip the query string from the address bar right away so the link reads as
+  // a plain /donations afterwards. presetUID is already captured above, so this
+  // cannot affect it.
   useEffect(() => {
-    if (!presetUID) return
-    setUserID(presetUID)
-    if (location.search) {
+    if (window.location.search) {
       navigate('/donations', { replace: true })
     }
-  }, [presetUID, location.search, navigate])
+  }, [navigate])
 
   useEffect(() => {
     let active = true
@@ -126,7 +127,9 @@ export function DonationsPage() {
   const rewardQuota = info?.quota_per_usd ?? 0
 
   function numericUserID(): number | null {
-    const value = Number.parseInt(userID.trim(), 10)
+    // The preset wins: when a link pinned the recipient there is no editable
+    // value, and state can never disagree with the link that was opened.
+    const value = Number.parseInt((presetUID || userID).trim(), 10)
     if (!Number.isFinite(value) || value <= 0) return null
     return value
   }
@@ -379,17 +382,28 @@ export function DonationsPage() {
             </Select>
           </FormRow>
 
-          <FormRow label={t('donations.fieldUserID')} hint={t('donations.fieldUserIDHint')} htmlFor="donation-user-id">
-            <Input
-              id="donation-user-id"
-              fullWidth
-              inputMode="numeric"
-              value={userID}
-              placeholder="1"
-              disabled={busy}
-              onChange={(event) => setUserID(event.target.value)}
-            />
-          </FormRow>
+          {presetUID ? (
+            // No input at all: the recipient is fixed by the link that was used,
+            // so there is nothing for the contributor to edit.
+            <FormRow label={t('donations.fieldUserID')} hint={t('donations.fieldUserIDLocked')}>
+              <div className="flex h-10 items-center gap-2 rounded-xl border border-border bg-surface-secondary px-3">
+                <Lock size={14} weight="bold" className="shrink-0 text-muted" />
+                <span className="mono truncate text-sm text-foreground">{presetUID}</span>
+              </div>
+            </FormRow>
+          ) : (
+            <FormRow label={t('donations.fieldUserID')} hint={t('donations.fieldUserIDHint')} htmlFor="donation-user-id">
+              <Input
+                id="donation-user-id"
+                fullWidth
+                inputMode="numeric"
+                value={userID}
+                placeholder="1"
+                disabled={busy}
+                onChange={(event) => setUserID(event.target.value)}
+              />
+            </FormRow>
+          )}
 
           <FormRow label={t('donations.fieldName')} hint={t('donations.fieldNameHint')} htmlFor="donation-name">
             <Input
