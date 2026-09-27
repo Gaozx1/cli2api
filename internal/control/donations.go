@@ -401,7 +401,7 @@ func (d *Donations) Submit(ctx context.Context, input DonationRequest) (Donation
 	if err != nil {
 		return DonationResult{}, err
 	}
-	fingerprint, err := d.checkClaimable(ctx, input.Format, payload, input.NewAPIUserID)
+	fingerprint, err := d.checkClaimable(ctx, input.Format, payload)
 	if err != nil {
 		return DonationResult{}, err
 	}
@@ -561,11 +561,6 @@ func (d *Donations) importAccount(ctx context.Context, providerID, region string
 // that was already paid.
 const donationLedgerSecret = "donation_reward_ledger"
 
-// donationMaxRewardsPerUser bounds how many rewards one New API user id may
-// collect. A contributor normally holds one or two accounts; a much larger
-// number is farming rather than contributing.
-const donationMaxRewardsPerUser = 3
-
 // donationCredentialFingerprint identifies a credential by its content, so the
 // same account cannot be contributed twice under different names.
 //
@@ -625,19 +620,18 @@ func (d *Donations) ledgerSnapshot(ctx context.Context) DonationRewardLedger {
 	return out
 }
 
-// checkClaimable refuses a submission that has already been paid, or that would
-// exceed the per-user limit. It returns the fingerprint to record once the
-// reward is actually issued.
-func (d *Donations) checkClaimable(ctx context.Context, format string, payload []byte, userID int) (string, error) {
+// checkClaimable refuses a submission whose credential has already been paid,
+// and returns the fingerprint to record once the reward is issued.
+//
+// Only the credential is deduplicated: one account is one reward, regardless of
+// who submits it or how many accounts a single contributor holds. There is no
+// per-user cap, so someone with several genuine accounts is paid for each.
+func (d *Donations) checkClaimable(ctx context.Context, format string, payload []byte) (string, error) {
 	fingerprint := donationCredentialFingerprint(format, payload)
 	ledger := d.ledgerSnapshot(ctx)
 	if claim, ok := ledger.Credentials[fingerprint]; ok {
 		return fingerprint, operationError("credential_already_contributed",
 			fmt.Sprintf("this account has already been contributed (credited to user %d)", claim.NewAPIUserID))
-	}
-	if ledger.Users[strconv.Itoa(userID)] >= donationMaxRewardsPerUser {
-		return fingerprint, operationError("reward_limit_reached",
-			fmt.Sprintf("this user id has already received %d contribution rewards", donationMaxRewardsPerUser))
 	}
 	return fingerprint, nil
 }
@@ -833,13 +827,6 @@ func (d *Donations) StartSession(ctx context.Context, input DonationStart) (Dona
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
 		name = providerID + " donation"
-	}
-
-	// Refuse a user who has already collected the maximum number of rewards
-	// before creating anything, so a refused attempt leaves no placeholder.
-	if ledger := d.ledgerSnapshot(ctx); ledger.Users[strconv.Itoa(input.NewAPIUserID)] >= donationMaxRewardsPerUser {
-		return DonationSession{}, operationError("reward_limit_reached",
-			fmt.Sprintf("this user id has already received %d contribution rewards", donationMaxRewardsPerUser))
 	}
 
 	// Created enabled, matching the console wizard: a Qoder login needs the

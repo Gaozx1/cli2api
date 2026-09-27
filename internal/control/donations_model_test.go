@@ -217,8 +217,9 @@ func TestSubmitRefusesDuplicateCredential(t *testing.T) {
 	}
 }
 
-// One New API user cannot farm the endpoint with many credentials.
-func TestSubmitEnforcesPerUserRewardLimit(t *testing.T) {
+// One contributor may hold several genuine accounts, and each is paid: there is
+// no per-user cap, only per-credential dedupe.
+func TestSubmitPaysEachDistinctCredentialForOneUser(t *testing.T) {
 	prober := &fakeProber{ready: true}
 	donations, _ := donationModelHarness(t, prober)
 	var hits int32
@@ -227,26 +228,33 @@ func TestSubmitEnforcesPerUserRewardLimit(t *testing.T) {
 	donations.BaseURL = site.URL
 	donations.Token = "t"
 
-	for i := 0; i < donationMaxRewardsPerUser; i++ {
+	const distinct = 5
+	for i := 0; i < distinct; i++ {
 		payload := []byte(`{"api_key":"user_` + string(rune('a'+i)) + `"}`)
-		if _, err := donations.Submit(context.Background(), DonationRequest{
+		result, err := donations.Submit(context.Background(), DonationRequest{
 			Format: "command-key-v1", NewAPIUserID: 7, Credential: payload,
-		}); err != nil {
-			t.Fatalf("submit %d: %v", i, err)
+		})
+		if err != nil {
+			t.Fatalf("distinct credential %d must be accepted: %v", i, err)
+		}
+		if !result.Credited {
+			t.Fatalf("distinct credential %d must be credited: %+v", i, result)
 		}
 	}
-	// One more distinct credential for the same user must be refused.
-	_, err := donations.Submit(context.Background(), DonationRequest{
+	if int(hits) != distinct {
+		t.Fatalf("hits = %d, want %d (one per distinct credential)", hits, distinct)
+	}
+
+	// The cap that used to exist must not: a sixth distinct credential from the
+	// same user is still paid.
+	result, err := donations.Submit(context.Background(), DonationRequest{
 		Format: "command-key-v1", NewAPIUserID: 7, Credential: []byte(`{"api_key":"user_extra"}`),
 	})
-	if err == nil {
-		t.Fatal("the per-user limit must be enforced")
+	if err != nil {
+		t.Fatalf("no per-user cap must apply: %v", err)
 	}
-	if !strings.Contains(err.Error(), "already received") {
-		t.Fatalf("err = %v, want a reward-limit refusal", err)
-	}
-	if int(hits) != donationMaxRewardsPerUser {
-		t.Fatalf("hits = %d, want %d", hits, donationMaxRewardsPerUser)
+	if !result.Credited {
+		t.Fatalf("the sixth credential must still be credited: %+v", result)
 	}
 }
 
