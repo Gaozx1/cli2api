@@ -26,6 +26,8 @@ func (h *Handler) HandleOverview(w http.ResponseWriter, r *http.Request) {
 	hotCount := 0
 	coolingCount := 0
 	inFlight := 0
+	contributedCount := 0
+	contributors := map[int]struct{}{}
 	for _, account := range accountViews {
 		if account.Ready {
 			readyCount++
@@ -35,6 +37,13 @@ func (h *Handler) HandleOverview(w http.ResponseWriter, r *http.Request) {
 		}
 		if account.DownUntil != "" {
 			coolingCount++
+		}
+		// A contributed account carries the New API user id that paid for it, so
+		// the overview reports how much of the pool arrived this way without a
+		// second query.
+		if account.ContributedBy > 0 {
+			contributedCount++
+			contributors[account.ContributedBy] = struct{}{}
 		}
 		inFlight += account.InFlight
 	}
@@ -52,6 +61,10 @@ func (h *Handler) HandleOverview(w http.ResponseWriter, r *http.Request) {
 		"worker": map[string]any{
 			"ok": readyCount > 0, "hot": hotCount > 0, "ready_count": readyCount,
 			"hot_count": hotCount, "account_count": len(accountViews),
+		},
+		"contributions": map[string]any{
+			"account_count":     contributedCount,
+			"contributor_count": len(contributors),
 		},
 		"routing": map[string]any{
 			"strategy":         h.Pool.RoutingStrategy(),
@@ -82,6 +95,8 @@ func (h *Handler) HandleOverviewSummary(w http.ResponseWriter, r *http.Request) 
 	hotCount := 0
 	coolingCount := 0
 	inFlight := 0
+	contributedCount := 0
+	contributors := map[int]struct{}{}
 	for _, account := range accountViews {
 		if account.Ready {
 			readyCount++
@@ -91,6 +106,10 @@ func (h *Handler) HandleOverviewSummary(w http.ResponseWriter, r *http.Request) 
 		}
 		if account.DownUntil != "" {
 			coolingCount++
+		}
+		if account.ContributedBy > 0 {
+			contributedCount++
+			contributors[account.ContributedBy] = struct{}{}
 		}
 		inFlight += account.InFlight
 	}
@@ -113,6 +132,10 @@ func (h *Handler) HandleOverviewSummary(w http.ResponseWriter, r *http.Request) 
 			"ready_count": readyCount, "hot_count": hotCount,
 			"account_count": len(accountViews), "cooling_count": coolingCount,
 			"in_flight": inFlight,
+		},
+		"contributions": map[string]any{
+			"account_count":     contributedCount,
+			"contributor_count": len(contributors),
 		},
 		"model_count": modelCount,
 		"routing": map[string]any{

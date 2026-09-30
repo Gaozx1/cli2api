@@ -27,7 +27,7 @@ const donationMaxBody = 256 << 10
 func (h *Handler) HandleDonations(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		h.writeDonationInfo(w)
+		h.writeDonationInfo(w, r)
 	case http.MethodPost:
 		h.HandleDonationStart(w, r)
 	default:
@@ -179,7 +179,7 @@ func decodeDonationBody(r *http.Request, target any) error {
 // writeDonationInfo describes what can be contributed so the page can render
 // the accepted formats without hardcoding them. Capabilities come from the
 // provider adapters, not from a provider list here.
-func (h *Handler) writeDonationInfo(w http.ResponseWriter) {
+func (h *Handler) writeDonationInfo(w http.ResponseWriter, r *http.Request) {
 	donations := h.donations()
 	if donations == nil {
 		writeErr(w, http.StatusServiceUnavailable, "donations_unavailable", "donations are not available")
@@ -192,7 +192,7 @@ func (h *Handler) writeDonationInfo(w http.ResponseWriter) {
 		"object":        "donation_info",
 		"default_usd":   rewardUSD,
 		"quota_per_usd": control.QuotaForUSD(1),
-		"formats":       donations.Formats(),
+		"formats":       donations.Formats(r.Context()),
 	})
 }
 

@@ -365,7 +365,7 @@ func TestCallbackRequiredFormatIsFlaggedAndNotPolled(t *testing.T) {
 	// Register a completer so the adapter advertises the callback capability.
 	donations.accounts.Providers.Register(providers.Adapter{ID: "trae", Login: &fakeCompletingLogin{fakeLogin: login}, Prober: &fakeProber{ready: true}, Models: &fakeModels{}})
 
-	formats := donations.Formats()
+	formats := donations.Formats(context.Background())
 	var trae *DonationFormatInfo
 	for i := range formats {
 		if formats[i].Provider == "trae" {
@@ -457,7 +457,7 @@ func TestFormatsReportAdapterCapabilities(t *testing.T) {
 	// so the two capability shapes can be compared.
 	donations.accounts.Providers.Register(providers.Adapter{ID: "trae", Login: &fakeCompletingLogin{fakeLogin: &fakeLogin{}}, Prober: &fakeProber{ready: true}, Models: &fakeModels{}})
 
-	formats := donations.Formats()
+	formats := donations.Formats(context.Background())
 	if len(formats) == 0 {
 		t.Fatal("no formats advertised")
 	}

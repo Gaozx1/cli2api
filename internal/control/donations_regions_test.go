@@ -14,7 +14,7 @@ import (
 // who then cannot contribute the account they actually hold.
 func TestFormatsListEveryRegion(t *testing.T) {
 	donations, _, _ := donationHarness(t, &fakeLogin{}, nil)
-	formats := donations.Formats()
+	formats := donations.Formats(context.Background())
 
 	type key struct{ provider, region string }
 	seen := map[key]int{}
@@ -47,7 +47,7 @@ func TestFormatsListEveryRegion(t *testing.T) {
 // two entries of the same provider.
 func TestFormatsCarryRegionLabel(t *testing.T) {
 	donations, _, _ := donationHarness(t, &fakeLogin{}, nil)
-	for _, f := range donations.Formats() {
+	for _, f := range donations.Formats(context.Background()) {
 		if f.Region == "" {
 			t.Errorf("format %s/%s has no region", f.Provider, f.Format)
 		}

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { useLocation } from 'react-router-dom'
 import { Button, Card, Chip, Input, Label, ListBox, Select, TextArea } from '@heroui/react'
 import { CheckCircle, HandHeart, Lock, Warning } from '@phosphor-icons/react'
 import { useI18n } from '@/hooks/useI18n'
@@ -59,7 +59,6 @@ function parseJSONCredential(raw: string): { value?: unknown; error?: string } {
 
 export function DonationsPage() {
   const { t } = useI18n()
-  const navigate = useNavigate()
   const location = useLocation()
   // A contribution link can carry the contributor's New API user id. It is held
   // in state rather than derived from the query string, because the query string
@@ -85,22 +84,17 @@ export function DonationsPage() {
   const timer = useRef<number | null>(null)
   const cancelled = useRef(false)
 
-  // Handle the uid query and clear it from the address bar.
+  // Read the uid from the query and keep it in state.
   //
-  // Keyed on location.search, NOT on mount: when the app is already showing
-  // /donations and only the query changes (an in-app link, or a pasted URL the
-  // router handles client-side), React Router keeps the same component mounted
-  // and this effect would never re-run on a [] dependency -- the tail stayed in
-  // the address bar and the field never locked. Keying on location.search also
-  // means clearing the query re-runs it once more with an empty search, which is
-  // harmless: the uid already lives in state.
+  // The query is deliberately LEFT in the address bar: the link is the
+  // contributor's own bookmark, and rewriting it made a shared URL stop working
+  // as a link. Keyed on location.search so an in-app navigation to a new uid is
+  // picked up too (React Router keeps this component mounted when only the query
+  // changes, so a [] dependency would miss it).
   useEffect(() => {
-    if (location.search) {
-      const next = uidFromQuery(location.search)
-      if (next) setPresetUID(next)
-      navigate('/donations', { replace: true })
-    }
-  }, [location.search, navigate])
+    const next = uidFromQuery(location.search)
+    if (next) setPresetUID(next)
+  }, [location.search])
 
   useEffect(() => {
     let active = true
@@ -135,7 +129,6 @@ export function DonationsPage() {
   const webAuth = Boolean(selected?.web_auth)
   const needsCallback = Boolean(session?.callback_required ?? selected?.callback_required)
   const rewardUSD = info?.default_usd ?? FALLBACK_REWARD_USD
-  const rewardQuota = info?.quota_per_usd ?? 0
 
   function numericUserID(): number | null {
     // The preset wins: when a link pinned the recipient there is no editable
@@ -160,7 +153,7 @@ export function DonationsPage() {
       setSession(current)
       if (current.credited) {
         setPhase('done')
-        setMessage(t('donations.success', { usd: current.credit_usd, quota: (current.credited_quota || 0).toLocaleString() }))
+        setMessage(t('donations.success'))
         return
       }
       if (current.status === 'failed') {
@@ -219,7 +212,7 @@ export function DonationsPage() {
       setSession(settled)
       if (settled.credited) {
         setPhase('done')
-        setMessage(t('donations.success', { usd: settled.credit_usd, quota: (settled.credited_quota || 0).toLocaleString() }))
+        setMessage(t('donations.success'))
         setCallbackUrl('')
       } else if (settled.status === 'failed') {
         setPhase('error')
@@ -329,7 +322,7 @@ export function DonationsPage() {
       const result = await submitDonation(body as never)
       if (result.credited) {
         setPhase('done')
-        setMessage(t('donations.success', { usd: result.credited_usd, quota: result.credited_quota.toLocaleString() }))
+        setMessage(t('donations.success'))
       } else {
         setPhase('error')
         setMessage(t('donations.creditFailed', { error: result.credit_error || '' }))
@@ -360,9 +353,7 @@ export function DonationsPage() {
         <div className="space-y-4">
           <div className="rounded-lg bg-default/40 p-3 text-sm">
             <p className="font-medium text-foreground">{t('donations.rewardTitle')}</p>
-            <p className="mt-1 text-muted">
-              {t('donations.rewardBody', { usd: rewardUSD, quota: rewardQuota.toLocaleString() })}
-            </p>
+            <p className="mt-1 text-muted">{t('donations.rewardBody')}</p>
           </div>
 
           <FormRow label={t('donations.fieldType')} htmlFor="donation-format">

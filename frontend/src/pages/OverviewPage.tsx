@@ -85,6 +85,10 @@ export function OverviewPage() {
   const hotAccounts = overview?.worker?.hot_count ?? 0
   const coolingAccounts = overview?.worker?.cooling_count ?? 0
   const inFlight = overview?.worker?.in_flight ?? 0
+  // Accounts that arrived through the public contribution page, and how many
+  // distinct New API users sent them.
+  const contributedAccounts = overview?.contributions?.account_count ?? 0
+  const contributorCount = overview?.contributions?.contributor_count ?? 0
   const traffic = stats ?? EMPTY_STATS
 
   useEffect(() => {
@@ -241,11 +245,12 @@ export function OverviewPage() {
               <ArrowUpRight size={12} />
             </Link>
           </div>
-          <div className="grid grid-cols-3 divide-x divide-separator border-b border-separator">
+          <div className="grid grid-cols-4 divide-x divide-separator border-b border-separator">
             {[
               [t('ready'), readyAccounts, 'ok'],
               [t('hot'), hotAccounts, hotAccounts ? 'ok' : ''],
               [t('inFlight'), inFlight, inFlight ? 'ok' : ''],
+              [t('statsContributed'), contributedAccounts, contributedAccounts ? 'ok' : ''],
             ].map(([label, value, state]) => (
               <div key={String(label)} className="px-4 py-3">
                 <div className="text-[11px] text-muted">{label}</div>
@@ -253,6 +258,11 @@ export function OverviewPage() {
                   <span className="mono text-lg font-semibold">{value}</span>
                   {state ? <span className="status-dot" data-state={state} /> : null}
                 </div>
+                {label === t('statsContributed') && contributedAccounts > 0 ? (
+                  <div className="mt-0.5 text-[10px] text-muted">
+                    {t('statsContributors', { count: contributorCount })}
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>

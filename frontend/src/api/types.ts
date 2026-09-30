@@ -113,6 +113,12 @@ export type Overview = {
     cooling_count?: number
     in_flight?: number
   }
+  // Accounts that arrived through the public contribution page, and how many
+  // distinct New API users sent them.
+  contributions?: {
+    account_count?: number
+    contributor_count?: number
+  }
   model_count?: number
   routing?: {
     strategy?: string

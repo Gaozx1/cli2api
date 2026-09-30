@@ -98,14 +98,24 @@ type DonationFormatInfo struct {
 	Description      string `json:"description"`
 }
 
-// Formats lists every contributable provider/region pair with its capabilities.
+// Formats lists every contributable provider/region pair with its capabilities,
+// restricted to the providers the operator has allowed.
 //
 // One entry per region, not per provider: Qoder ships global+cn and WorkBuddy
 // ships cn+global, and a contributor must be able to pick the one their account
 // actually belongs to. Collapsing to DefaultRegion silently hides the others.
-func (d *Donations) Formats() []DonationFormatInfo {
+func (d *Donations) Formats(ctx context.Context) []DonationFormatInfo {
+	allowed := donationAllowedSet(DonationAllowedProviders(ctx, d.settings))
 	formats := make([]DonationFormatInfo, 0, 8)
 	for _, descriptor := range providers.List() {
+		// The allow-list is a policy decision, so it is applied here rather than
+		// in the page: a provider that is not offered must also be refused if a
+		// caller posts it directly.
+		if allowed != nil {
+			if _, ok := allowed[strings.ToLower(descriptor.ID)]; !ok {
+				continue
+			}
+		}
 		regions := descriptor.Regions
 		if len(regions) == 0 {
 			// No declared regions: still advertise one entry so the provider is
@@ -139,6 +149,18 @@ func (d *Donations) Formats() []DonationFormatInfo {
 	return formats
 }
 
+// DonationAllowed reports whether a provider may be contributed at all. It is the
+// gate the start/submit paths use, so a provider hidden from the page cannot be
+// contributed by posting to the API directly.
+func (d *Donations) DonationAllowed(ctx context.Context, providerID string) bool {
+	allowed := donationAllowedSet(DonationAllowedProviders(ctx, d.settings))
+	if allowed == nil {
+		return true
+	}
+	_, ok := allowed[strings.ToLower(strings.TrimSpace(providerID))]
+	return ok
+}
+
 // now is injectable so tests can drive session expiry without sleeping.
 func (d *Donations) now() time.Time {
 	if d != nil && d.clock != nil {
@@ -152,6 +174,10 @@ func (d *Donations) now() time.Time {
 const (
 	donationBaseURLSecret = "donation_newapi_base_url"
 	donationTokenSecret   = "donation_newapi_token"
+	// donationFormatsSecret holds the comma-separated allow-list of provider ids
+	// a contributor may offer. Empty means "no restriction", so an operator who
+	// never touches the setting keeps the historical behaviour.
+	donationFormatsSecret = "donation_allowed_providers"
 	// donationQuotaPerUSD is the New API quota unit count for one USD. New API
 	// stores quota as an integer and renders it as quota / QuotaPerUnit dollars.
 	donationQuotaPerUSD = 500000
@@ -159,6 +185,51 @@ const (
 	// raw auth blob rather than a JSON credential like the other providers.
 	donationQoderFormat = "qoder-native-v1"
 )
+
+// DonationAllowedProviders returns the provider ids a contributor may offer,
+// lower-cased and de-duplicated. An empty slice means every provider is allowed.
+func DonationAllowedProviders(ctx context.Context, settings *Settings) []string {
+	if settings == nil {
+		return nil
+	}
+	raw, ok, err := settings.GetSecret(ctx, donationFormatsSecret)
+	if err != nil || !ok {
+		return nil
+	}
+	return ParseDonationAllowedProviders(raw)
+}
+
+// ParseDonationAllowedProviders splits the stored list. Exported so the console
+// normalises a submitted list through the same rule the gate uses.
+func ParseDonationAllowedProviders(raw string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 8)
+	for _, part := range strings.Split(raw, ",") {
+		id := strings.ToLower(strings.TrimSpace(part))
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+// donationAllowedSet is the allow-list as a set for filtering. A nil map means
+// "everything is allowed", which is distinct from an empty (but non-nil) map.
+func donationAllowedSet(list []string) map[string]struct{} {
+	if len(list) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(list))
+	for _, id := range list {
+		set[id] = struct{}{}
+	}
+	return set
+}
 
 // DonationSessionTTL bounds how long a started web-authorization round may wait
 // before the pending account is swept. The provider login must finish inside it.
@@ -390,6 +461,9 @@ func (d *Donations) Submit(ctx context.Context, input DonationRequest) (Donation
 	providerID, err := donationProvider(input.Format)
 	if err != nil {
 		return DonationResult{}, err
+	}
+	if !d.DonationAllowed(ctx, providerID) {
+		return DonationResult{}, operationError("provider_not_contributable", "this account type is not open for contributions")
 	}
 	if input.NewAPIUserID <= 0 {
 		return DonationResult{}, operationError("invalid_newapi_user_id", "a numeric New API user id is required")
@@ -856,6 +930,9 @@ func (d *Donations) StartSession(ctx context.Context, input DonationStart) (Dona
 	providerID, err := donationProvider(input.Format)
 	if err != nil {
 		return DonationSession{}, err
+	}
+	if !d.DonationAllowed(ctx, providerID) {
+		return DonationSession{}, operationError("provider_not_contributable", "this account type is not open for contributions")
 	}
 	if input.NewAPIUserID <= 0 {
 		return DonationSession{}, operationError("invalid_newapi_user_id", "a numeric New API user id is required")
