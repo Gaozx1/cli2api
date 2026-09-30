@@ -21,28 +21,29 @@ type System struct {
 	Mu                *sync.Mutex
 }
 type SystemSettingsPatch struct {
-	CrossProviderModelPool   *bool             `json:"cross_provider_model_pool"`
-	CheckinDisabledAccounts  *bool             `json:"checkin_disabled_accounts"`
-	RoutingStrategy          *string           `json:"routing_strategy"`
-	ProxyURL                 *string           `json:"proxy_url"`
-	WorkBuddyCheckinTime     *string           `json:"workbuddy_checkin_time"`
-	CheckinTimes             map[string]string `json:"checkin_times"`
-	DonationBaseURL          *string           `json:"donation_base_url"`
-	DonationToken            *string           `json:"donation_token"`
-	DonationAllowedProviders *[]string         `json:"donation_allowed_providers"`
+	CrossProviderModelPool  *bool             `json:"cross_provider_model_pool"`
+	CheckinDisabledAccounts *bool             `json:"checkin_disabled_accounts"`
+	RoutingStrategy         *string           `json:"routing_strategy"`
+	ProxyURL                *string           `json:"proxy_url"`
+	WorkBuddyCheckinTime    *string           `json:"workbuddy_checkin_time"`
+	CheckinTimes            map[string]string `json:"checkin_times"`
+	DonationBaseURL         *string           `json:"donation_base_url"`
+	DonationToken           *string           `json:"donation_token"`
+	DonationAllowedFormats  *[]string         `json:"donation_allowed_formats"`
 }
 type SystemSettings struct {
-	CrossProviderModelPool   bool                          `json:"cross_provider_model_pool"`
-	CheckinDisabledAccounts  bool                          `json:"checkin_disabled_accounts"`
-	RoutingStrategy          string                        `json:"routing_strategy"`
-	ProxyURL                 string                        `json:"proxy_url"`
-	WorkBuddyCheckinTime     string                        `json:"workbuddy_checkin_time"`
-	CheckinTimes             map[string]string             `json:"checkin_times"`
-	Timezone                 string                        `json:"timezone"`
-	SessionAffinity          executor.SessionAffinityStats `json:"session_affinity"`
-	DonationBaseURL          string                        `json:"donation_base_url"`
-	DonationConfigured       bool                          `json:"donation_configured"`
-	DonationAllowedProviders []string                      `json:"donation_allowed_providers"`
+	CrossProviderModelPool  bool                          `json:"cross_provider_model_pool"`
+	CheckinDisabledAccounts bool                          `json:"checkin_disabled_accounts"`
+	RoutingStrategy         string                        `json:"routing_strategy"`
+	ProxyURL                string                        `json:"proxy_url"`
+	WorkBuddyCheckinTime    string                        `json:"workbuddy_checkin_time"`
+	CheckinTimes            map[string]string             `json:"checkin_times"`
+	Timezone                string                        `json:"timezone"`
+	SessionAffinity         executor.SessionAffinityStats `json:"session_affinity"`
+	DonationBaseURL         string                        `json:"donation_base_url"`
+	DonationConfigured      bool                          `json:"donation_configured"`
+	// "provider:region" entries; empty means every account type is open.
+	DonationAllowedFormats []string `json:"donation_allowed_formats"`
 }
 
 func (h *System) Current(ctx context.Context) SystemSettings {
@@ -60,7 +61,7 @@ func (h *System) Current(ctx context.Context) SystemSettings {
 		}
 		donationBase, _, _ = h.Settings.GetSecret(ctx, donationBaseURLSecret)
 		donationToken, _, _ = h.Settings.GetSecret(ctx, donationTokenSecret)
-		donationAllowed = DonationAllowedProviders(ctx, h.Settings)
+		donationAllowed = DonationAllowedFormats(ctx, h.Settings)
 	}
 	settings := SystemSettings{
 		CrossProviderModelPool:  h.CrossProviderPool.Load(),
@@ -73,8 +74,8 @@ func (h *System) Current(ctx context.Context) SystemSettings {
 		DonationConfigured: strings.TrimSpace(donationBase) != "" && strings.TrimSpace(donationToken) != "",
 		// An empty list means every provider is contributable, which is what the
 		// console shows as "all".
-		DonationAllowedProviders: donationAllowed,
-		Timezone:                 time.Now().Format("MST -07:00"),
+		DonationAllowedFormats: donationAllowed,
+		Timezone:               time.Now().Format("MST -07:00"),
 	}
 	for _, descriptor := range providers.List() {
 		if descriptor.SupportsCheckin() && h.Settings != nil {
@@ -90,8 +91,26 @@ func (h *System) Current(ctx context.Context) SystemSettings {
 	return settings
 }
 
+// descriptorHasRegion reports whether a provider declares the given region. A
+// provider with no declared regions accepts only its default one.
+func descriptorHasRegion(descriptor providers.ProviderDescriptor, regionID string) bool {
+	if len(descriptor.Regions) == 0 {
+		return regionID == strings.ToLower(strings.TrimSpace(descriptor.DefaultRegion))
+	}
+	for _, region := range descriptor.Regions {
+		id := strings.ToLower(strings.TrimSpace(region.ID))
+		if id == "" {
+			id = strings.ToLower(strings.TrimSpace(descriptor.DefaultRegion))
+		}
+		if id == regionID {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *System) Patch(ctx context.Context, input SystemSettingsPatch) error {
-	if input.CrossProviderModelPool == nil && input.CheckinDisabledAccounts == nil && input.RoutingStrategy == nil && input.ProxyURL == nil && input.WorkBuddyCheckinTime == nil && len(input.CheckinTimes) == 0 && input.DonationBaseURL == nil && input.DonationToken == nil && input.DonationAllowedProviders == nil {
+	if input.CrossProviderModelPool == nil && input.CheckinDisabledAccounts == nil && input.RoutingStrategy == nil && input.ProxyURL == nil && input.WorkBuddyCheckinTime == nil && len(input.CheckinTimes) == 0 && input.DonationBaseURL == nil && input.DonationToken == nil && input.DonationAllowedFormats == nil {
 		return operationError("invalid_request", "a system setting is required")
 	}
 	var strategy string
@@ -209,26 +228,35 @@ func (h *System) Patch(ctx context.Context, input SystemSettingsPatch) error {
 			return operationError("system_settings_save_failed", err.Error())
 		}
 	}
-	if input.DonationAllowedProviders != nil {
+	if input.DonationAllowedFormats != nil {
 		// Validate against the provider registry rather than trusting the list:
-		// an unknown id would silently match nothing and read as "no
+		// an unknown entry would silently match nothing and read as "no
 		// contributions accepted", which is not what the operator asked for.
-		normalized := make([]string, 0, len(*input.DonationAllowedProviders))
+		// Each entry is "provider:region", and the region must exist on that
+		// provider -- allowing "qoder:global" must not also open "qoder:cn".
+		normalized := make([]string, 0, len(*input.DonationAllowedFormats))
 		seen := map[string]struct{}{}
-		for _, raw := range *input.DonationAllowedProviders {
-			id := strings.ToLower(strings.TrimSpace(raw))
-			if id == "" {
+		for _, raw := range *input.DonationAllowedFormats {
+			entry := strings.ToLower(strings.TrimSpace(raw))
+			if entry == "" {
 				continue
 			}
-			if _, dup := seen[id]; dup {
+			providerID, regionID, hasRegion := strings.Cut(entry, ":")
+			if !hasRegion || regionID == "" {
+				return operationError("provider_unsupported", "donation_allowed_formats entries must be provider:region, got "+entry)
+			}
+			descriptor, found := providers.Get(providerID)
+			if !found || descriptor.ID != providerID {
+				return operationError("provider_unsupported", "unknown provider in donation_allowed_formats: "+providerID)
+			}
+			if !descriptorHasRegion(descriptor, regionID) {
+				return operationError("provider_unsupported", "unknown region in donation_allowed_formats: "+entry)
+			}
+			if _, dup := seen[entry]; dup {
 				continue
 			}
-			descriptor, found := providers.Get(id)
-			if !found || descriptor.ID != id {
-				return operationError("provider_unsupported", "unknown provider in donation_allowed_providers: "+id)
-			}
-			seen[id] = struct{}{}
-			normalized = append(normalized, id)
+			seen[entry] = struct{}{}
+			normalized = append(normalized, entry)
 		}
 		if err := h.Settings.SetSecretOrEmpty(ctx, donationFormatsSecret, strings.Join(normalized, ",")); err != nil {
 			return operationError("system_settings_save_failed", err.Error())

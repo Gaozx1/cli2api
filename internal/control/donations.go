@@ -105,17 +105,9 @@ type DonationFormatInfo struct {
 // ships cn+global, and a contributor must be able to pick the one their account
 // actually belongs to. Collapsing to DefaultRegion silently hides the others.
 func (d *Donations) Formats(ctx context.Context) []DonationFormatInfo {
-	allowed := donationAllowedSet(DonationAllowedProviders(ctx, d.settings))
+	allowed := donationAllowedSet(DonationAllowedFormats(ctx, d.settings))
 	formats := make([]DonationFormatInfo, 0, 8)
 	for _, descriptor := range providers.List() {
-		// The allow-list is a policy decision, so it is applied here rather than
-		// in the page: a provider that is not offered must also be refused if a
-		// caller posts it directly.
-		if allowed != nil {
-			if _, ok := allowed[strings.ToLower(descriptor.ID)]; !ok {
-				continue
-			}
-		}
 		regions := descriptor.Regions
 		if len(regions) == 0 {
 			// No declared regions: still advertise one entry so the provider is
@@ -131,6 +123,16 @@ func (d *Donations) Formats(ctx context.Context) []DonationFormatInfo {
 				regionID := region.ID
 				if regionID == "" {
 					regionID = descriptor.DefaultRegion
+				}
+				// The allow-list is a policy decision, so it is applied here and
+				// not only in the page: a format that is not offered must also be
+				// refused if a caller posts it directly. It is keyed by the
+				// provider AND the region, so allowing Qoder CN does not also open
+				// Qoder Global.
+				if allowed != nil {
+					if _, ok := allowed[donationFormatToken(descriptor.ID, regionID)]; !ok {
+						continue
+					}
 				}
 				formats = append(formats, DonationFormatInfo{
 					Format:           format,
@@ -149,16 +151,26 @@ func (d *Donations) Formats(ctx context.Context) []DonationFormatInfo {
 	return formats
 }
 
-// DonationAllowed reports whether a provider may be contributed at all. It is the
-// gate the start/submit paths use, so a provider hidden from the page cannot be
-// contributed by posting to the API directly.
-func (d *Donations) DonationAllowed(ctx context.Context, providerID string) bool {
-	allowed := donationAllowedSet(DonationAllowedProviders(ctx, d.settings))
+// DonationAllowed reports whether one provider+region may be contributed. An
+// empty allow-list means everything is allowed.
+//
+// The scope is the provider AND its region, not the provider alone: Qoder and
+// WorkBuddy each ship a CN and a global deployment, and those are separate
+// accounts. Restricting by provider would take the global variant with it when
+// only the CN one was meant. The token is "provider:region", the same spelling
+// the API-key grants use.
+func (d *Donations) DonationAllowed(ctx context.Context, providerID, regionID string) bool {
+	allowed := donationAllowedSet(DonationAllowedFormats(ctx, d.settings))
 	if allowed == nil {
 		return true
 	}
-	_, ok := allowed[strings.ToLower(strings.TrimSpace(providerID))]
+	_, ok := allowed[donationFormatToken(providerID, regionID)]
 	return ok
+}
+
+// donationFormatToken is the canonical allow-list entry for a provider+region.
+func donationFormatToken(providerID, regionID string) string {
+	return strings.ToLower(strings.TrimSpace(providerID)) + ":" + strings.ToLower(strings.TrimSpace(regionID))
 }
 
 // now is injectable so tests can drive session expiry without sleeping.
@@ -174,10 +186,11 @@ func (d *Donations) now() time.Time {
 const (
 	donationBaseURLSecret = "donation_newapi_base_url"
 	donationTokenSecret   = "donation_newapi_token"
-	// donationFormatsSecret holds the comma-separated allow-list of provider ids
-	// a contributor may offer. Empty means "no restriction", so an operator who
-	// never touches the setting keeps the historical behaviour.
-	donationFormatsSecret = "donation_allowed_providers"
+	// donationFormatsSecret holds the comma-separated allow-list of
+	// provider:region entries a contributor may offer ("qoder:cn,workbuddy:global").
+	// Empty means "no restriction", so an operator who never touches the setting
+	// keeps the historical behaviour.
+	donationFormatsSecret = "donation_allowed_formats"
 	// donationQuotaPerUSD is the New API quota unit count for one USD. New API
 	// stores quota as an integer and renders it as quota / QuotaPerUnit dollars.
 	donationQuotaPerUSD = 500000
@@ -186,9 +199,10 @@ const (
 	donationQoderFormat = "qoder-native-v1"
 )
 
-// DonationAllowedProviders returns the provider ids a contributor may offer,
-// lower-cased and de-duplicated. An empty slice means every provider is allowed.
-func DonationAllowedProviders(ctx context.Context, settings *Settings) []string {
+// DonationAllowedFormats returns the "provider:region" entries a contributor may
+// offer, lower-cased and de-duplicated. An empty slice means every format is
+// allowed.
+func DonationAllowedFormats(ctx context.Context, settings *Settings) []string {
 	if settings == nil {
 		return nil
 	}
@@ -196,12 +210,12 @@ func DonationAllowedProviders(ctx context.Context, settings *Settings) []string 
 	if err != nil || !ok {
 		return nil
 	}
-	return ParseDonationAllowedProviders(raw)
+	return ParseDonationAllowedFormats(raw)
 }
 
-// ParseDonationAllowedProviders splits the stored list. Exported so the console
+// ParseDonationAllowedFormats splits the stored list. Exported so the console
 // normalises a submitted list through the same rule the gate uses.
-func ParseDonationAllowedProviders(raw string) []string {
+func ParseDonationAllowedFormats(raw string) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, 8)
 	for _, part := range strings.Split(raw, ",") {
@@ -462,15 +476,16 @@ func (d *Donations) Submit(ctx context.Context, input DonationRequest) (Donation
 	if err != nil {
 		return DonationResult{}, err
 	}
-	if !d.DonationAllowed(ctx, providerID) {
-		return DonationResult{}, operationError("provider_not_contributable", "this account type is not open for contributions")
-	}
 	if input.NewAPIUserID <= 0 {
 		return DonationResult{}, operationError("invalid_newapi_user_id", "a numeric New API user id is required")
 	}
 	region := strings.ToLower(strings.TrimSpace(input.Region))
 	if region == "" {
 		region = defaultDonationRegion(providerID)
+	}
+	// Checked with the resolved region: the allow-list is per provider+region.
+	if !d.DonationAllowed(ctx, providerID, region) {
+		return DonationResult{}, operationError("provider_not_contributable", "this account type is not open for contributions")
 	}
 
 	// The reward is priced here, not by the caller: credit_usd is accepted and
@@ -931,21 +946,23 @@ func (d *Donations) StartSession(ctx context.Context, input DonationStart) (Dona
 	if err != nil {
 		return DonationSession{}, err
 	}
-	if !d.DonationAllowed(ctx, providerID) {
-		return DonationSession{}, operationError("provider_not_contributable", "this account type is not open for contributions")
-	}
 	if input.NewAPIUserID <= 0 {
 		return DonationSession{}, operationError("invalid_newapi_user_id", "a numeric New API user id is required")
+	}
+	// Resolve the region before the allow-list check: the list is per
+	// provider+region, so an unset region must first become its default.
+	region := strings.ToLower(strings.TrimSpace(input.Region))
+	if region == "" {
+		region = defaultDonationRegion(providerID)
+	}
+	if !d.DonationAllowed(ctx, providerID, region) {
+		return DonationSession{}, operationError("provider_not_contributable", "this account type is not open for contributions")
 	}
 	if d.accounts == nil {
 		return DonationSession{}, operationError("donations_unavailable", "account service is unavailable")
 	}
 	if !d.supportsWebAuth(providerID) {
 		return DonationSession{}, operationError("web_auth_unsupported", "this provider does not support web authorization")
-	}
-	region := strings.ToLower(strings.TrimSpace(input.Region))
-	if region == "" {
-		region = defaultDonationRegion(providerID)
 	}
 	usd := donationRewardUSD()
 	name := strings.TrimSpace(input.Name)

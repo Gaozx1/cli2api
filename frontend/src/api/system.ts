@@ -66,8 +66,8 @@ export type SystemSettings = {
   workbuddy_checkin_time: string
   checkin_times: Record<string, string>
   timezone: string
-  // Empty means every provider may be contributed.
-  donation_allowed_providers: string[]
+  // "provider:region" entries; empty means every account type is open.
+  donation_allowed_formats: string[]
   session_affinity?: {
     ttl_seconds?: number
     capacity?: number
@@ -100,7 +100,7 @@ export function fetchSystemSettings() {
   return api<SystemSettings>('/api/system/settings')
 }
 
-export function updateSystemSettings(input: { cross_provider_model_pool?: boolean; routing_strategy?: SystemSettings['routing_strategy']; proxy_url?: string; workbuddy_checkin_time?: string; checkin_times?: Record<string, string>; donation_allowed_providers?: string[] }) {
+export function updateSystemSettings(input: { cross_provider_model_pool?: boolean; routing_strategy?: SystemSettings['routing_strategy']; proxy_url?: string; workbuddy_checkin_time?: string; checkin_times?: Record<string, string>; donation_allowed_formats?: string[] }) {
   return api<SystemSettings>('/api/system/settings', {
     method: 'PATCH',
     body: JSON.stringify(input),

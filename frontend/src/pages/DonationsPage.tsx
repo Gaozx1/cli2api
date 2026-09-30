@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { Button, Card, Chip, Input, Label, ListBox, Select, TextArea } from '@heroui/react'
-import { CheckCircle, HandHeart, Lock, Warning } from '@phosphor-icons/react'
+import { CheckCircle, HandHeart, Warning } from '@phosphor-icons/react'
 import { useI18n } from '@/hooks/useI18n'
 import {
   cancelDonationSession,
@@ -351,10 +351,15 @@ export function DonationsPage() {
 
       <Card className="p-5">
         <div className="space-y-4">
-          <div className="rounded-lg bg-default/40 p-3 text-sm">
-            <p className="font-medium text-foreground">{t('donations.rewardTitle')}</p>
-            <p className="mt-1 text-muted">{t('donations.rewardBody')}</p>
-          </div>
+          {/* A link that pinned a recipient hides both the reward panel and the
+              user-id row: the recipient is set by the link, so there is nothing
+              to show and nothing to edit. The plain page keeps both. */}
+          {presetUID ? null : (
+            <div className="rounded-lg bg-default/40 p-3 text-sm">
+              <p className="font-medium text-foreground">{t('donations.rewardTitle')}</p>
+              <p className="mt-1 text-muted">{t('donations.rewardBody')}</p>
+            </div>
+          )}
 
           <FormRow label={t('donations.fieldType')} htmlFor="donation-format">
             <Select
@@ -384,16 +389,7 @@ export function DonationsPage() {
             </Select>
           </FormRow>
 
-          {presetUID ? (
-            // No input at all: the recipient is fixed by the link that was used,
-            // so there is nothing for the contributor to edit.
-            <FormRow label={t('donations.fieldUserID')} hint={t('donations.fieldUserIDLocked')}>
-              <div className="flex h-10 items-center gap-2 rounded-xl border border-border bg-surface-secondary px-3">
-                <Lock size={14} weight="bold" className="shrink-0 text-muted" />
-                <span className="mono truncate text-sm text-foreground">{presetUID}</span>
-              </div>
-            </FormRow>
-          ) : (
+          {presetUID ? null : (
             <FormRow label={t('donations.fieldUserID')} hint={t('donations.fieldUserIDHint')} htmlFor="donation-user-id">
               <Input
                 id="donation-user-id"
